@@ -1,47 +1,178 @@
 #!/usr/bin/env python3
 """
-VPS Control & Monitoring Dashboard
+VPS Control & Monitoring Dashboard v1.1.0
 Lightweight, zero-dependency management server using Python standard library.
 Features Server-Side Pre-rendering (SSR) + Client-Side Live Polling (CSR).
+GitHub: https://github.com/Skverna84/vps-dashboard
 """
 
 import os
 import sys
+import time
 import json
 import base64
 import shutil
+import tarfile
+import tempfile
+import datetime
 import platform
 import subprocess
+from urllib.parse import urlparse, parse_qs
 from http import HTTPStatus
 from http.server import HTTPServer, ThreadingHTTPServer, BaseHTTPRequestHandler
 
+VERSION = "1.1.0"
 CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
 
 def load_config():
     if os.path.exists(CONFIG_PATH):
-        with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-            return json.load(f)
+        try:
+            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            pass
     return {
         "port": 8080,
         "username": "admin",
         "password": "changeme",
         "title": "VPS Control & Monitor",
-        "refresh_interval_sec": 3
+        "refresh_interval_sec": 3,
+        "custom_services": []
     }
+
+def save_config(cfg):
+    try:
+        with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, indent=2, ensure_ascii=False)
+        return True
+    except Exception:
+        return False
 
 CONFIG = load_config()
 
+# Global state for Network I/O calculation
+NET_STATE = {
+    "last_time": 0.0,
+    "last_rx": 0,
+    "last_tx": 0,
+    "rx_rate_kb": 0.0,
+    "tx_rate_kb": 0.0,
+    "total_rx_mb": 0.0,
+    "total_tx_mb": 0.0,
+}
+
 def run_cmd(cmd, timeout=15):
     try:
-        res = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout)
+        res = subprocess.run(cmd, shell=True, capture_output=True, text=True, errors="replace", timeout=timeout)
         return res.returncode, res.stdout.strip(), res.stderr.strip()
     except subprocess.TimeoutExpired:
         return -1, "", "Command timed out"
     except Exception as e:
         return -1, "", str(e)
 
+def get_network_metrics():
+    now = time.time()
+    rx_total = 0
+    tx_total = 0
+    try:
+        with open("/proc/net/dev", "r") as f:
+            lines = f.readlines()
+        for line in lines[2:]:
+            parts = line.split(":")
+            if len(parts) == 2:
+                iface = parts[0].strip()
+                if iface == "lo":
+                    continue
+                fields = parts[1].split()
+                if len(fields) >= 9:
+                    rx_total += int(fields[0])
+                    tx_total += int(fields[8])
+    except Exception:
+        pass
+
+    diff_time = now - NET_STATE["last_time"]
+    if NET_STATE["last_time"] > 0 and diff_time > 0:
+        diff_rx = max(0, rx_total - NET_STATE["last_rx"])
+        diff_tx = max(0, tx_total - NET_STATE["last_tx"])
+        NET_STATE["rx_rate_kb"] = round((diff_rx / diff_time) / 1024, 1)
+        NET_STATE["tx_rate_kb"] = round((diff_tx / diff_time) / 1024, 1)
+
+    NET_STATE["last_time"] = now
+    NET_STATE["last_rx"] = rx_total
+    NET_STATE["last_tx"] = tx_total
+    NET_STATE["total_rx_mb"] = round(rx_total / (1024 * 1024), 1)
+    NET_STATE["total_tx_mb"] = round(tx_total / (1024 * 1024), 1)
+
+    return {
+        "rx_rate_kb": NET_STATE["rx_rate_kb"],
+        "tx_rate_kb": NET_STATE["tx_rate_kb"],
+        "total_rx_mb": NET_STATE["total_rx_mb"],
+        "total_tx_mb": NET_STATE["total_tx_mb"],
+        "total_rx_gb": round(NET_STATE["total_rx_mb"] / 1024, 2),
+        "total_tx_gb": round(NET_STATE["total_tx_mb"] / 1024, 2)
+    }
+
+def get_top_processes():
+    _, out, _ = run_cmd("ps -eo pid,user,comm,%cpu,%mem --sort=-%cpu | head -n 6")
+    processes = []
+    lines = out.splitlines()
+    if len(lines) > 1:
+        for line in lines[1:]:
+            parts = line.split()
+            if len(parts) >= 5:
+                processes.append({
+                    "pid": parts[0],
+                    "user": parts[1],
+                    "name": parts[2],
+                    "cpu": parts[3],
+                    "mem": parts[4]
+                })
+    return processes
+
+def get_listening_ports():
+    _, out, _ = run_cmd("ss -tulpn | grep LISTEN")
+    ports = []
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) >= 5:
+            proto = parts[0]
+            local_addr = parts[4]
+            port = local_addr.split(":")[-1]
+            proc = "-"
+            if len(parts) >= 7:
+                raw_proc = parts[6]
+                if '("' in raw_proc:
+                    try:
+                        pname = raw_proc.split('("')[1].split('"')[0]
+                        ppid = raw_proc.split('pid=')[1].split(',')[0]
+                        proc = f"{pname} (PID: {ppid})"
+                    except Exception:
+                        proc = raw_proc
+                else:
+                    proc = raw_proc
+            ports.append({"proto": proto.upper(), "port": port, "address": local_addr, "process": proc})
+    return ports
+
+def get_audit_log():
+    _, out, _ = run_cmd("last -n 8")
+    logins = []
+    for line in out.splitlines():
+        if line.startswith("reboot") or line.startswith("wtmp begins") or not line.strip():
+            continue
+        parts = line.split()
+        if len(parts) >= 6:
+            user = parts[0]
+            ip = parts[2]
+            time_str = " ".join(parts[3:7])
+            duration = parts[-1] if "(" in parts[-1] else "active"
+            logins.append({"user": user, "ip": ip, "time": time_str, "duration": duration})
+    return logins
+
 def get_system_metrics():
-    load1, load5, load15 = os.getloadavg()
+    try:
+        load1, load5, load15 = os.getloadavg()
+    except (AttributeError, OSError):
+        load1, load5, load15 = 0.0, 0.0, 0.0
     cpu_count = os.cpu_count() or 1
     cpu_pct = min(100.0, round((load1 / cpu_count) * 100, 1))
 
@@ -98,7 +229,10 @@ def get_system_metrics():
     hours = int((uptime_sec % 86400) // 3600)
     mins = int((uptime_sec % 3600) // 60)
 
+    net_metrics = get_network_metrics()
+
     return {
+        "version": VERSION,
         "hostname": platform.node(),
         "kernel": platform.release(),
         "os": "Ubuntu 24.04 LTS (Noble)",
@@ -123,6 +257,10 @@ def get_system_metrics():
             "pct": disk_pct,
             "inode_pct": inode_pct
         },
+        "network": net_metrics,
+        "top_processes": get_top_processes(),
+        "listening_ports": get_listening_ports(),
+        "audit_log": get_audit_log(),
         "uptime": {
             "days": days,
             "hours": hours,
@@ -152,6 +290,7 @@ def get_projects_status():
         "latest_version": "1.1.16",
         "update_available": (rd_version != "1.1.16"),
         "services": ["rustdesksignal", "rustdeskrelay"],
+        "primary_service": "rustdesksignal",
         "ports": ["21115-21119 (TCP)", "21116 (UDP)"],
         "description": "Самохостинговый сервер подключения и ретрансляции RustDesk"
     })
@@ -170,14 +309,19 @@ def get_projects_status():
         "latest_version": "1.3.0",
         "update_available": False,
         "services": ["gohttpserver"],
+        "primary_service": "gohttpserver",
         "ports": ["8000 (TCP)"],
         "description": "Легковесный HTTP веб-файловый сервер с Basic Auth"
     })
 
-    # 3. Docker & Containerd
+    # 3. Docker Engine & Containerd
     _, doc_status, _ = run_cmd("systemctl is-active docker.service")
     _, doc_ver, _ = run_cmd("docker --version 2>&1 | awk '{print $3}' | tr -d ','")
     doc_version = doc_ver.strip() if doc_ver else "29.1.3"
+
+    # Check docker containers count
+    _, doc_cnt, _ = run_cmd("docker ps -q 2>/dev/null | wc -l")
+    doc_running = int(doc_cnt.strip()) if doc_cnt.strip().isdigit() else 0
 
     projects.append({
         "id": "docker",
@@ -188,11 +332,12 @@ def get_projects_status():
         "latest_version": doc_version,
         "update_available": False,
         "services": ["docker"],
-        "ports": ["-"],
+        "primary_service": "docker",
+        "ports": [f"{doc_running} активных контейнеров"],
         "description": "Среда контейнеризации Docker"
     })
 
-    # 4. Nginx
+    # 4. Nginx Web Server
     _, ng_status, _ = run_cmd("systemctl is-active nginx.service")
     _, ng_ver, _ = run_cmd("nginx -v 2>&1 | awk -F'/' '{print $2}' | awk '{print $1}'")
     ng_version = ng_ver.strip() if ng_ver else "1.24.0"
@@ -206,11 +351,12 @@ def get_projects_status():
         "latest_version": ng_version,
         "update_available": False,
         "services": ["nginx"],
+        "primary_service": "nginx",
         "ports": ["80 (TCP)"],
         "description": "Высокопроизводительный веб-сервер и обратный прокси"
     })
 
-    # 5. Fail2ban
+    # 5. Fail2ban Security
     _, f2b_status, _ = run_cmd("systemctl is-active fail2ban.service")
     _, f2b_ver, _ = run_cmd("fail2ban-server --version 2>&1 | head -1 | awk '{print $2}'")
     f2b_version = f2b_ver.strip() if f2b_ver else "1.0.2"
@@ -224,9 +370,28 @@ def get_projects_status():
         "latest_version": f2b_version,
         "update_available": False,
         "services": ["fail2ban"],
+        "primary_service": "fail2ban",
         "ports": ["-"],
         "description": "Служба защиты от атак полного перебора паролей (брутфорса)"
     })
+
+    # 6. Custom Added Services
+    custom_svcs = CONFIG.get("custom_services", [])
+    for svc in custom_svcs:
+        _, s_status, _ = run_cmd(f"systemctl is-active {svc}.service")
+        projects.append({
+            "id": svc,
+            "name": f"Service: {svc}",
+            "category": "Custom Systemd Service",
+            "status": s_status,
+            "installed_version": "systemd",
+            "latest_version": "systemd",
+            "update_available": False,
+            "services": [svc],
+            "primary_service": svc,
+            "ports": ["custom"],
+            "description": f"Пользовательская служба systemd ({svc})"
+        })
 
     return projects
 
@@ -278,9 +443,13 @@ def render_html():
         update_badge = '<button class="btn btn-sm btn-warning" onclick="updateRustDesk()">Обновить (1.1.16)</button>' if p["update_available"] else f'<span class="badge badge-info">Актуально (v{p["installed_version"]})</span>'
         actions_html = ""
         if p["services"]:
-            s0 = p["services"][0]
+            s0 = p["primary_service"]
             stop_start = f'<button class="btn btn-sm btn-danger" onclick="serviceAction(\'{s0}\', \'stop\')">Остановить</button>' if p["status"] == "active" else f'<button class="btn btn-sm btn-success" onclick="serviceAction(\'{s0}\', \'start\')">Запустить</button>'
-            actions_html = f'<button class="btn btn-sm btn-primary" onclick="serviceAction(\'{s0}\', \'restart\')">Перезапуск</button> {stop_start}'
+            actions_html = f"""
+            <button class="btn btn-sm btn-outline" onclick="openLogsModal('{s0}')">📜 Логи</button>
+            <button class="btn btn-sm btn-primary" onclick="serviceAction('{s0}', 'restart')">Перезапуск</button>
+            {stop_start}
+            """
 
         proj_cards_html += f"""
         <div class="project-card">
@@ -320,6 +489,31 @@ def render_html():
             </div>
             """
 
+    # Pre-render Top Processes
+    top_proc_html = ""
+    for pr in sys_data["top_processes"]:
+        top_proc_html += f"""
+        <tr style="border-bottom: 1px solid var(--card-border);">
+          <td style="padding: 6px 8px; font-family: monospace;">{pr['pid']}</td>
+          <td style="padding: 6px 8px; font-weight: 600;">{pr['name']}</td>
+          <td style="padding: 6px 8px; color: var(--text-muted);">{pr['user']}</td>
+          <td style="padding: 6px 8px; font-weight: 600; color: var(--accent);">{pr['cpu']}%</td>
+          <td style="padding: 6px 8px; font-weight: 600; color: var(--warning);">{pr['mem']}%</td>
+        </tr>
+        """
+
+    # Pre-render Audit Log
+    audit_html = ""
+    for a in sys_data["audit_log"]:
+        audit_html += f"""
+        <div class="ip-item">
+          <div>
+            <span style="color: var(--success); font-weight: 600;">👤 {a['user']}</span> from <b>{a['ip']}</b>
+            <div style="font-size: 0.75rem; color: var(--text-muted);">{a['time']} ({a['duration']})</div>
+          </div>
+        </div>
+        """
+
     expected = base64.b64encode(f"{CONFIG['username']}:{CONFIG['password']}".encode()).decode()
 
     html = f"""<!DOCTYPE html>
@@ -327,7 +521,7 @@ def render_html():
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>VPS Dashboard | 185.189.13.52</title>
+  <title>VPS Dashboard v{VERSION} | 185.189.13.52</title>
   <style>
     :root {{
       --bg: #0f172a;
@@ -341,6 +535,7 @@ def render_html():
       --warning: #f59e0b;
       --danger: #ef4444;
       --bar-bg: #334155;
+      --modal-bg: rgba(15, 23, 42, 0.85);
     }}
     [data-theme="light"] {{
       --bg: #f1f5f9;
@@ -354,65 +549,81 @@ def render_html():
       --warning: #d97706;
       --danger: #dc2626;
       --bar-bg: #e2e8f0;
+      --modal-bg: rgba(241, 245, 249, 0.85);
     }}
     * {{ box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }}
     body {{ background-color: var(--bg); color: var(--text); min-height: 100vh; padding: 1.5rem; transition: background-color 0.3s; }}
-    .container {{ max-width: 1200px; margin: 0 auto; }}
+    .container {{ max-width: 1280px; margin: 0 auto; }}
 
-    header {{ display: flex; justify-content: space-between; align-items: center; margin-bottom: 2rem; flex-wrap: wrap; gap: 1rem; }}
+    header {{ display: flex; justify-content: space-between; align-items: center; margin-bottom: 1.5rem; flex-wrap: wrap; gap: 1rem; }}
     .logo-area {{ display: flex; align-items: center; gap: 0.75rem; }}
-    .logo-icon {{ width: 40px; height: 40px; background: linear-gradient(135deg, #3b82f6, #8b5cf6); border-radius: 10px; display: flex; align-items: center; justify-content: center; font-weight: bold; color: white; font-size: 1.25rem; }}
-    .title h1 {{ font-size: 1.5rem; font-weight: 700; }}
-    .title p {{ color: var(--text-muted); font-size: 0.875rem; }}
-    .header-controls {{ display: flex; align-items: center; gap: 0.75rem; }}
-    .btn {{ background: var(--card); border: 1px solid var(--card-border); color: var(--text); padding: 0.5rem 1rem; border-radius: 8px; cursor: pointer; font-size: 0.875rem; font-weight: 500; display: inline-flex; align-items: center; gap: 0.5rem; transition: all 0.2s; }}
+    .logo-icon {{ width: 42px; height: 42px; background: linear-gradient(135deg, #3b82f6, #8b5cf6); border-radius: 12px; display: flex; align-items: center; justify-content: center; font-weight: bold; color: white; font-size: 1.25rem; box-shadow: 0 4px 10px rgba(59, 130, 246, 0.3); }}
+    .title h1 {{ font-size: 1.4rem; font-weight: 700; display: flex; align-items: center; gap: 0.5rem; }}
+    .title p {{ color: var(--text-muted); font-size: 0.85rem; }}
+    .header-controls {{ display: flex; align-items: center; gap: 0.6rem; flex-wrap: wrap; }}
+
+    .btn {{ background: var(--card); border: 1px solid var(--card-border); color: var(--text); padding: 0.45rem 0.9rem; border-radius: 8px; cursor: pointer; font-size: 0.85rem; font-weight: 500; display: inline-flex; align-items: center; gap: 0.4rem; transition: all 0.2s; user-select: none; }}
     .btn:hover {{ background: var(--card-border); }}
     .btn-primary {{ background: var(--accent); border-color: var(--accent); color: white; }}
     .btn-primary:hover {{ background: var(--accent-hover); }}
-    .btn-sm {{ padding: 0.25rem 0.6rem; font-size: 0.75rem; border-radius: 6px; }}
+    .btn-outline {{ background: transparent; border-color: var(--card-border); }}
+    .btn-sm {{ padding: 0.25rem 0.55rem; font-size: 0.75rem; border-radius: 6px; }}
     .btn-danger {{ background: rgba(239, 68, 68, 0.15); border-color: var(--danger); color: var(--danger); }}
     .btn-danger:hover {{ background: var(--danger); color: white; }}
     .btn-success {{ background: rgba(16, 185, 129, 0.15); border-color: var(--success); color: var(--success); }}
     .btn-success:hover {{ background: var(--success); color: white; }}
+
+    .select-input {{ background: var(--card); border: 1px solid var(--card-border); color: var(--text); padding: 0.45rem 0.6rem; border-radius: 8px; font-size: 0.85rem; outline: none; cursor: pointer; }}
+    .text-input {{ background: var(--card); border: 1px solid var(--card-border); color: var(--text); padding: 0.4rem 0.6rem; border-radius: 6px; font-size: 0.8rem; outline: none; }}
 
     .live-badge {{ display: flex; align-items: center; gap: 6px; font-size: 0.75rem; font-weight: 600; padding: 4px 10px; border-radius: 20px; background: rgba(16, 185, 129, 0.15); color: var(--success); border: 1px solid rgba(16, 185, 129, 0.3); }}
     .pulse-dot {{ width: 8px; height: 8px; border-radius: 50%; background: var(--success); animation: pulse 1.5s infinite; }}
     @keyframes pulse {{ 0% {{ opacity: 1; transform: scale(1); }} 50% {{ opacity: 0.4; transform: scale(0.8); }} 100% {{ opacity: 1; transform: scale(1); }} }}
 
     .grid {{ display: grid; gap: 1.25rem; }}
-    .grid-4 {{ grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); margin-bottom: 2rem; }}
-    .grid-2 {{ grid-template-columns: 2fr 1fr; margin-bottom: 2rem; }}
-    @media (max-width: 900px) {{ .grid-2 {{ grid-template-columns: 1fr; }} }}
+    .grid-5 {{ grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); margin-bottom: 1.5rem; }}
+    .grid-2 {{ grid-template-columns: 2fr 1.1fr; margin-bottom: 1.5rem; }}
+    @media (max-width: 960px) {{ .grid-2 {{ grid-template-columns: 1fr; }} }}
 
-    .card {{ background: var(--card); border: 1px solid var(--card-border); border-radius: 14px; padding: 1.25rem; box-shadow: 0 4px 12px rgba(0,0,0,0.05); }}
-    .card-header {{ display: flex; justify-content: space-between; align-items: center; margin-bottom: 1rem; }}
-    .card-title {{ font-size: 1.1rem; font-weight: 600; display: flex; align-items: center; gap: 0.5rem; }}
+    .card {{ background: var(--card); border: 1px solid var(--card-border); border-radius: 14px; padding: 1.2rem; box-shadow: 0 4px 12px rgba(0,0,0,0.05); }}
+    .card-header {{ display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.8rem; }}
+    .card-title {{ font-size: 1.05rem; font-weight: 600; display: flex; align-items: center; gap: 0.5rem; }}
 
-    .metric-value {{ font-size: 1.75rem; font-weight: 700; margin-bottom: 0.5rem; }}
-    .metric-sub {{ font-size: 0.8rem; color: var(--text-muted); margin-bottom: 0.75rem; }}
-    .progress-bar {{ width: 100%; height: 8px; background: var(--bar-bg); border-radius: 4px; overflow: hidden; margin-top: 0.5rem; }}
+    .metric-value {{ font-size: 1.6rem; font-weight: 700; margin-bottom: 0.3rem; }}
+    .metric-sub {{ font-size: 0.78rem; color: var(--text-muted); margin-bottom: 0.5rem; }}
+    .progress-bar {{ width: 100%; height: 7px; background: var(--bar-bg); border-radius: 4px; overflow: hidden; margin-top: 0.4rem; }}
     .progress-fill {{ height: 100%; background: var(--accent); border-radius: 4px; transition: width 0.4s ease; }}
     .progress-fill.warning {{ background: var(--warning); }}
     .progress-fill.danger {{ background: var(--danger); }}
 
-    .project-card {{ display: flex; justify-content: space-between; align-items: center; padding: 1rem; border-bottom: 1px solid var(--card-border); }}
+    .sparkline-canvas {{ width: 100%; height: 42px; display: block; margin-top: 6px; border-radius: 6px; }}
+
+    .project-card {{ display: flex; justify-content: space-between; align-items: center; padding: 0.9rem; border-bottom: 1px solid var(--card-border); gap: 0.5rem; }}
     .project-card:last-child {{ border-bottom: none; }}
     .project-info {{ display: flex; flex-direction: column; gap: 0.25rem; }}
-    .project-name {{ font-weight: 600; font-size: 1rem; display: flex; align-items: center; gap: 0.5rem; }}
-    .project-desc {{ font-size: 0.8rem; color: var(--text-muted); }}
-    .badge {{ font-size: 0.7rem; font-weight: 600; padding: 3px 8px; border-radius: 12px; }}
+    .project-name {{ font-weight: 600; font-size: 0.95rem; display: flex; align-items: center; gap: 0.5rem; flex-wrap: wrap; }}
+    .project-desc {{ font-size: 0.78rem; color: var(--text-muted); }}
+    .badge {{ font-size: 0.68rem; font-weight: 600; padding: 2px 7px; border-radius: 10px; }}
     .badge-success {{ background: rgba(16, 185, 129, 0.15); color: var(--success); }}
     .badge-danger {{ background: rgba(239, 68, 68, 0.15); color: var(--danger); }}
     .badge-warning {{ background: rgba(245, 158, 11, 0.15); color: var(--warning); }}
     .badge-info {{ background: rgba(59, 130, 246, 0.15); color: var(--accent); }}
-    .project-actions {{ display: flex; align-items: center; gap: 0.5rem; }}
+    .project-actions {{ display: flex; align-items: center; gap: 0.4rem; flex-wrap: wrap; }}
 
-    .ip-item {{ display: flex; justify-content: space-between; align-items: center; padding: 0.5rem 0; border-bottom: 1px dashed var(--card-border); font-size: 0.85rem; }}
+    .ip-item {{ display: flex; justify-content: space-between; align-items: center; padding: 0.45rem 0; border-bottom: 1px dashed var(--card-border); font-size: 0.82rem; }}
     .ip-item:last-child {{ border-bottom: none; }}
 
-    .terminal-box {{ background: #000; color: #10b981; font-family: monospace; font-size: 0.8rem; padding: 1rem; border-radius: 8px; max-height: 200px; overflow-y: auto; margin-top: 1rem; white-space: pre-wrap; }}
+    .terminal-box {{ background: #000; color: #10b981; font-family: monospace; font-size: 0.78rem; padding: 0.8rem; border-radius: 8px; max-height: 200px; overflow-y: auto; margin-top: 0.8rem; white-space: pre-wrap; }}
 
-    #toast {{ position: fixed; bottom: 20px; right: 20px; padding: 12px 20px; border-radius: 8px; background: var(--card); border: 1px solid var(--card-border); color: var(--text); box-shadow: 0 10px 25px rgba(0,0,0,0.2); transform: translateY(100px); opacity: 0; transition: all 0.3s cubic-bezier(0.68, -0.55, 0.265, 1.55); z-index: 1000; font-size: 0.9rem; font-weight: 500; }}
+    /* Modal dialog */
+    .modal-overlay {{ position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: var(--modal-bg); backdrop-filter: blur(4px); display: none; align-items: center; justify-content: center; z-index: 2000; padding: 1rem; }}
+    .modal-overlay.active {{ display: flex; }}
+    .modal-content {{ background: var(--card); border: 1px solid var(--card-border); border-radius: 16px; width: 100%; max-width: 800px; max-height: 85vh; display: flex; flex-direction: column; box-shadow: 0 20px 40px rgba(0,0,0,0.3); overflow: hidden; }}
+    .modal-header {{ display: flex; justify-content: space-between; align-items: center; padding: 1rem 1.2rem; border-bottom: 1px solid var(--card-border); }}
+    .modal-body {{ padding: 1.2rem; overflow-y: auto; flex: 1; }}
+    .modal-footer {{ padding: 0.8rem 1.2rem; border-top: 1px solid var(--card-border); display: flex; justify-content: flex-end; gap: 0.5rem; }}
+
+    #toast {{ position: fixed; bottom: 20px; right: 20px; padding: 12px 20px; border-radius: 8px; background: var(--card); border: 1px solid var(--card-border); color: var(--text); box-shadow: 0 10px 25px rgba(0,0,0,0.2); transform: translateY(100px); opacity: 0; transition: all 0.3s cubic-bezier(0.68, -0.55, 0.265, 1.55); z-index: 3000; font-size: 0.85rem; font-weight: 500; }}
     #toast.show {{ transform: translateY(0); opacity: 1; }}
   </style>
 </head>
@@ -422,19 +633,28 @@ def render_html():
       <div class="logo-area">
         <div class="logo-icon">VPS</div>
         <div class="title">
-          <h1 id="txt-title">Управление сервером 185.189.13.52</h1>
+          <h1 id="txt-title">Управление сервером 185.189.13.52 <span class="badge badge-info">v{VERSION}</span></h1>
           <p id="txt-hostinfo">{sys_data['hostname']} | {sys_data['os']} | Uptime: {sys_data['uptime']['days']} дн. {sys_data['uptime']['hours']} ч.</p>
         </div>
       </div>
       <div class="header-controls">
         <div class="live-badge"><div class="pulse-dot"></div> <span id="txt-live">ОНЛАЙН</span></div>
+        <select class="select-input" id="refresh-rate" onchange="changeInterval()">
+          <option value="3000">⏱️ 3 сек</option>
+          <option value="1000">⚡ 1 сек</option>
+          <option value="5000">⏳ 5 сек</option>
+          <option value="0">⏸️ Пауза</option>
+        </select>
+        <button class="btn btn-outline" onclick="downloadBackup()">💾 <span id="txt-backup">Бэкап</span></button>
+        <button class="btn btn-outline" onclick="updateSelf()">🔄 <span id="txt-update-self">Обновить панель</span></button>
         <button class="btn" id="btn-lang" onclick="toggleLang()">EN / RU</button>
         <button class="btn" id="btn-theme" onclick="toggleTheme()">☀️ / 🌙</button>
         <button class="btn btn-primary" onclick="loadAllData()"><span id="txt-refresh">Обновить</span></button>
       </div>
     </header>
 
-    <div class="grid grid-4">
+    <!-- 5 Resources Cards Grid -->
+    <div class="grid grid-5">
       <div class="card">
         <div class="card-header">
           <span class="card-title" id="txt-cpu-title">⚡ Процессор</span>
@@ -443,6 +663,7 @@ def render_html():
         <div class="metric-value" id="cpu-pct">{sys_data['cpu_pct']}%</div>
         <div class="metric-sub" id="cpu-load">Load: {', '.join(map(str, sys_data['load_avg']))}</div>
         <div class="progress-bar"><div class="progress-fill" id="cpu-bar" style="width: {sys_data['cpu_pct']}%"></div></div>
+        <canvas id="cpu-chart" class="sparkline-canvas" width="220" height="42"></canvas>
       </div>
 
       <div class="card">
@@ -451,18 +672,19 @@ def render_html():
           <span class="badge badge-info" id="ram-pct">{sys_data['ram']['pct']}%</span>
         </div>
         <div class="metric-value" id="ram-used">{sys_data['ram']['used_mb']} MB</div>
-        <div class="metric-sub" id="ram-sub">{sys_data['ram']['pct']}% of {sys_data['ram']['total_mb']} MB ({sys_data['ram']['free_mb']} MB free)</div>
+        <div class="metric-sub" id="ram-sub">{sys_data['ram']['pct']}% of {sys_data['ram']['total_mb']} MB</div>
         <div class="progress-bar"><div class="progress-fill" id="ram-bar" style="width: {sys_data['ram']['pct']}%"></div></div>
+        <canvas id="ram-chart" class="sparkline-canvas" width="220" height="42"></canvas>
       </div>
 
       <div class="card">
         <div class="card-header">
-          <span class="card-title" id="txt-swap-title">🔄 Файл подкачки</span>
-          <span class="badge badge-info" id="swap-pct">{sys_data['swap']['pct']}%</span>
+          <span class="card-title" id="txt-net-title">🌐 Сеть (I/O)</span>
+          <span class="badge badge-success" id="net-speed-badge">Live</span>
         </div>
-        <div class="metric-value" id="swap-used">{sys_data['swap']['used_mb']} MB</div>
-        <div class="metric-sub" id="swap-sub">Total {sys_data['swap']['total_mb']} MB</div>
-        <div class="progress-bar"><div class="progress-fill" id="swap-bar" style="width: {sys_data['swap']['pct']}%"></div></div>
+        <div class="metric-value" id="net-speed">⬇️ {sys_data['network']['rx_rate_kb']} KB/s</div>
+        <div class="metric-sub" id="net-tx-speed">⬆️ {sys_data['network']['tx_rate_kb']} KB/s</div>
+        <div class="metric-sub" id="net-totals" style="margin-top: 0.4rem; font-size: 0.72rem;">Всего: ⬇️ {sys_data['network']['total_rx_gb']} GB | ⬆️ {sys_data['network']['total_tx_gb']} GB</div>
       </div>
 
       <div class="card">
@@ -471,22 +693,62 @@ def render_html():
           <span class="badge badge-info" id="disk-pct">{sys_data['disk']['pct']}%</span>
         </div>
         <div class="metric-value" id="disk-free">{sys_data['disk']['free_gb']} GB</div>
-        <div class="metric-sub" id="disk-sub">Free of {sys_data['disk']['total_gb']} GB ({sys_data['disk']['pct']}% used)</div>
+        <div class="metric-sub" id="disk-sub">Свободно из {sys_data['disk']['total_gb']} GB ({sys_data['disk']['pct']}% used)</div>
         <div class="progress-bar"><div class="progress-fill" id="disk-bar" style="width: {sys_data['disk']['pct']}%"></div></div>
+      </div>
+
+      <div class="card">
+        <div class="card-header">
+          <span class="card-title" id="txt-swap-title">🔄 Файл подкачки</span>
+          <span class="badge badge-info" id="swap-pct">{sys_data['swap']['pct']}%</span>
+        </div>
+        <div class="metric-value" id="swap-used">{sys_data['swap']['used_mb']} MB</div>
+        <div class="metric-sub" id="swap-sub">Всего {sys_data['swap']['total_mb']} MB</div>
+        <div class="progress-bar"><div class="progress-fill" id="swap-bar" style="width: {sys_data['swap']['pct']}%"></div></div>
       </div>
     </div>
 
+    <!-- Main Content Layout -->
     <div class="grid grid-2">
+      <!-- Left Column: Projects + Top Processes + APT -->
       <div>
-        <div class="card" style="margin-bottom: 1.5rem;">
+        <div class="card" style="margin-bottom: 1.25rem;">
           <div class="card-header">
             <span class="card-title" id="txt-projects-title">📦 Установленные проекты и службы</span>
+            <div style="display: flex; gap: 0.4rem;">
+              <button class="btn btn-sm btn-outline" onclick="openPortsModal()">🔌 <span id="txt-btn-ports">Порты</span></button>
+              <button class="btn btn-sm btn-primary" onclick="addCustomService()">+ <span id="txt-btn-addsvc">Служба</span></button>
+            </div>
           </div>
           <div id="projects-list">
             {proj_cards_html}
           </div>
         </div>
 
+        <!-- Top 5 Processes Card -->
+        <div class="card" style="margin-bottom: 1.25rem;">
+          <div class="card-header">
+            <span class="card-title" id="txt-top-proc-title">🔥 Топ-5 процессов (CPU / RAM)</span>
+          </div>
+          <div style="overflow-x: auto;">
+            <table style="width: 100%; text-align: left; font-size: 0.8rem; border-collapse: collapse;">
+              <thead>
+                <tr style="border-bottom: 1px solid var(--card-border); color: var(--text-muted);">
+                  <th style="padding: 6px 8px;">PID</th>
+                  <th style="padding: 6px 8px;" id="th-proc-name">Процесс</th>
+                  <th style="padding: 6px 8px;" id="th-proc-user">Пользователь</th>
+                  <th style="padding: 6px 8px;">% CPU</th>
+                  <th style="padding: 6px 8px;">% RAM</th>
+                </tr>
+              </thead>
+              <tbody id="top-processes-tbody">
+                {top_proc_html}
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        <!-- System Updates Card -->
         <div class="card">
           <div class="card-header">
             <span class="card-title" id="txt-sysup-title">🔄 Обновления системы (APT)</span>
@@ -494,8 +756,8 @@ def render_html():
           </div>
           <div style="display: flex; justify-content: space-between; align-items: center;">
             <div>
-              <div style="font-size: 1.1rem; font-weight: 600;" id="apt-status-text">Ожидает проверки</div>
-              <div style="font-size: 0.8rem; color: var(--text-muted);" id="apt-sub-text">Нажмите «Проверить обновления»</div>
+              <div style="font-size: 1.05rem; font-weight: 600;" id="apt-status-text">Ожидает проверки</div>
+              <div style="font-size: 0.78rem; color: var(--text-muted);" id="apt-sub-text">Нажмите «Проверить обновления»</div>
             </div>
             <button class="btn btn-success" id="btn-upgrade-apt" style="display: none;" onclick="upgradeSystem()">Установить обновления</button>
           </div>
@@ -503,25 +765,87 @@ def render_html():
         </div>
       </div>
 
+      <!-- Right Column: Security & Audit -->
       <div>
-        <div class="card">
+        <div class="card" style="margin-bottom: 1.25rem;">
           <div class="card-header">
             <span class="card-title" id="txt-sec-title">🛡️ Защита Fail2ban</span>
             <span class="badge badge-danger" id="banned-count">{sec_data['banned_count']} Banned</span>
           </div>
-          <p style="font-size: 0.8rem; color: var(--text-muted); margin-bottom: 1rem;" id="txt-sec-desc">
-            Активные блокировки IP-адресов за попытки подбора паролей.
+          <p style="font-size: 0.78rem; color: var(--text-muted); margin-bottom: 0.8rem;" id="txt-sec-desc">
+            Блокировка ботов и брутфорс атак по SSH.
           </p>
-          <div style="font-weight: 600; font-size: 0.85rem; margin-bottom: 0.5rem;" id="txt-banned-list">Список заблокированных IP:</div>
-          <div id="banned-ips-list" style="margin-bottom: 1.5rem;">
+
+          <!-- Custom Ban input -->
+          <div style="display: flex; gap: 0.4rem; margin-bottom: 1rem;">
+            <input type="text" id="custom-ban-ip" class="text-input" placeholder="IP для бана (e.g. 1.2.3.4)" style="flex: 1;">
+            <button class="btn btn-sm btn-danger" onclick="customBan()"><span id="txt-btn-ban">Забанить IP</span></button>
+          </div>
+
+          <div style="font-weight: 600; font-size: 0.82rem; margin-bottom: 0.4rem;" id="txt-banned-list">Список заблокированных IP:</div>
+          <div id="banned-ips-list" style="margin-bottom: 1.2rem; max-height: 180px; overflow-y: auto;">
             {banned_html}
           </div>
 
-          <div style="font-weight: 600; font-size: 0.85rem; margin-bottom: 0.5rem;" id="txt-recent-attacks">Последние попытки перебора:</div>
-          <div id="failed-logins-list" style="max-height: 250px; overflow-y: auto;">
+          <div style="font-weight: 600; font-size: 0.82rem; margin-bottom: 0.4rem;" id="txt-recent-attacks">Последние попытки перебора:</div>
+          <div id="failed-logins-list" style="max-height: 200px; overflow-y: auto;">
             {attacks_html}
           </div>
         </div>
+
+        <!-- Audit Log Card -->
+        <div class="card">
+          <div class="card-header">
+            <span class="card-title" id="txt-audit-title">🔑 Успешные входы на сервер</span>
+          </div>
+          <div id="audit-logins-list" style="max-height: 220px; overflow-y: auto;">
+            {audit_html}
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Modal: Live Logs Viewer -->
+  <div class="modal-overlay" id="logs-modal">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h3 style="font-size: 1.1rem;" id="logs-modal-title">📜 Логи службы</h3>
+        <button class="btn btn-sm btn-outline" onclick="closeLogsModal()">✕</button>
+      </div>
+      <div class="modal-body">
+        <div id="logs-modal-terminal" class="terminal-box" style="max-height: 55vh; height: 55vh; margin: 0;">Загрузка журнала...</div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn-outline" onclick="refreshCurrentLogs()">🔄 Обновить</button>
+        <button class="btn btn-primary" onclick="closeLogsModal()">Закрыть</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Modal: Listening Ports -->
+  <div class="modal-overlay" id="ports-modal">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h3 style="font-size: 1.1rem;" id="txt-ports-modal-title">🔌 Слушающие сетевые порты (Listening Ports)</h3>
+        <button class="btn btn-sm btn-outline" onclick="closePortsModal()">✕</button>
+      </div>
+      <div class="modal-body">
+        <table style="width: 100%; text-align: left; font-size: 0.85rem; border-collapse: collapse;">
+          <thead>
+            <tr style="border-bottom: 1px solid var(--card-border); color: var(--text-muted);">
+              <th style="padding: 8px;">Протокол</th>
+              <th style="padding: 8px;">Порт</th>
+              <th style="padding: 8px;">Адрес</th>
+              <th style="padding: 8px;">Процесс / Служба</th>
+            </tr>
+          </thead>
+          <tbody id="ports-modal-tbody">
+          </tbody>
+        </table>
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn-primary" onclick="closePortsModal()">Закрыть</button>
       </div>
     </div>
   </div>
@@ -532,20 +856,31 @@ def render_html():
     const API_AUTH = "Basic {expected}";
     let currentLang = localStorage.getItem("lang") || "ru";
     let currentTheme = localStorage.getItem("theme") || "dark";
+    let refreshTimer = null;
+    let currentInterval = 3000;
+    let activeLogService = "";
+
+    const cpuHistory = [{sys_data['cpu_pct']}];
+    const ramHistory = [{sys_data['ram']['pct']}];
 
     const dict = {{
       ru: {{
         title: "Управление сервером 185.189.13.52",
         live: "ОНЛАЙН",
         refresh: "Обновить",
+        backup: "Бэкап",
+        updateSelf: "Обновить панель",
         cpu: "⚡ Процессор",
         ram: "🧠 Память RAM",
+        net: "🌐 Сеть (I/O)",
         swap: "🔄 Файл подкачки",
         disk: "💾 Накопитель",
         projects: "📦 Установленные проекты и службы",
+        topProc: "🔥 Топ-5 процессов (CPU / RAM)",
         sysup: "🔄 Обновления системы (APT)",
         sec: "🛡️ Защита Fail2ban",
-        secDesc: "Активные блокировки IP-адресов за попытки подбора паролей.",
+        secDesc: "Блокировка ботов и брутфорс атак по SSH.",
+        audit: "🔑 Успешные входы на сервер",
         bannedList: "Список заблокированных IP:",
         recentAttacks: "Последние попытки перебора:",
         noBans: "Нет активных банов",
@@ -557,6 +892,11 @@ def render_html():
         start: "Запустить",
         stop: "Остановить",
         unban: "Разблокировать",
+        banBtn: "Забанить IP",
+        portsBtn: "Порты",
+        addSvcBtn: "Служба",
+        thProcName: "Процесс",
+        thProcUser: "Пользователь",
         uptimeDays: "дн.",
         uptimeHours: "ч.",
         uptimeMins: "мин."
@@ -565,14 +905,19 @@ def render_html():
         title: "VPS Dashboard 185.189.13.52",
         live: "ONLINE",
         refresh: "Refresh",
+        backup: "Backup",
+        updateSelf: "Update Dashboard",
         cpu: "⚡ CPU Load",
         ram: "🧠 RAM Memory",
+        net: "🌐 Network (I/O)",
         swap: "🔄 Swap File",
         disk: "💾 Disk Storage",
         projects: "📦 Installed Projects & Services",
+        topProc: "🔥 Top 5 Processes (CPU / RAM)",
         sysup: "🔄 System Updates (APT)",
         sec: "🛡️ Fail2ban Security",
         secDesc: "Active IP bans against brute-force password attempts.",
+        audit: "🔑 Successful Logins",
         bannedList: "Currently Banned IPs:",
         recentAttacks: "Recent Failed Attempts:",
         noBans: "No active IP bans",
@@ -584,6 +929,11 @@ def render_html():
         start: "Start",
         stop: "Stop",
         unban: "Unban",
+        banBtn: "Ban IP",
+        portsBtn: "Ports",
+        addSvcBtn: "Service",
+        thProcName: "Process",
+        thProcUser: "User",
         uptimeDays: "d",
         uptimeHours: "h",
         uptimeMins: "m"
@@ -603,23 +953,68 @@ def render_html():
       return await res.json();
     }}
 
+    function drawSparkline(canvasId, data, color) {{
+      const canvas = document.getElementById(canvasId);
+      if (!canvas) return;
+      const ctx = canvas.getContext("2d");
+      const w = canvas.width;
+      const h = canvas.height;
+      ctx.clearRect(0, 0, w, h);
+
+      if (data.length < 2) return;
+
+      const step = w / (data.length - 1);
+      ctx.beginPath();
+      ctx.moveTo(0, h - (data[0] / 100) * (h - 6) - 3);
+
+      for (let i = 1; i < data.length; i++) {{
+        const x = i * step;
+        const y = h - (data[i] / 100) * (h - 6) - 3;
+        ctx.lineTo(x, y);
+      }}
+
+      ctx.strokeStyle = color;
+      ctx.lineWidth = 2;
+      ctx.stroke();
+
+      // Gradient Fill
+      ctx.lineTo(w, h);
+      ctx.lineTo(0, h);
+      ctx.closePath();
+      const grad = ctx.createLinearGradient(0, 0, 0, h);
+      grad.addColorStop(0, color + "55");
+      grad.addColorStop(1, color + "05");
+      ctx.fillStyle = grad;
+      ctx.fill();
+    }}
+
     function applyLang() {{
       const t = dict[currentLang];
-      document.getElementById("txt-title").innerText = t.title;
+      document.getElementById("txt-title").innerHTML = `${{t.title}} <span class="badge badge-info">v{VERSION}</span>`;
       document.getElementById("txt-live").innerText = t.live;
       document.getElementById("txt-refresh").innerText = t.refresh;
+      document.getElementById("txt-backup").innerText = t.backup;
+      document.getElementById("txt-update-self").innerText = t.updateSelf;
       document.getElementById("txt-cpu-title").innerText = t.cpu;
       document.getElementById("txt-ram-title").innerText = t.ram;
+      document.getElementById("txt-net-title").innerText = t.net;
       document.getElementById("txt-swap-title").innerText = t.swap;
       document.getElementById("txt-disk-title").innerText = t.disk;
       document.getElementById("txt-projects-title").innerText = t.projects;
+      document.getElementById("txt-top-proc-title").innerText = t.topProc;
       document.getElementById("txt-sysup-title").innerText = t.sysup;
       document.getElementById("txt-sec-title").innerText = t.sec;
       document.getElementById("txt-sec-desc").innerText = t.secDesc;
+      document.getElementById("txt-audit-title").innerText = t.audit;
       document.getElementById("txt-banned-list").innerText = t.bannedList;
       document.getElementById("txt-recent-attacks").innerText = t.recentAttacks;
       document.getElementById("btn-check-apt").innerText = t.checkApt;
       document.getElementById("btn-upgrade-apt").innerText = t.upgradeApt;
+      document.getElementById("txt-btn-ban").innerText = t.banBtn;
+      document.getElementById("txt-btn-ports").innerText = t.portsBtn;
+      document.getElementById("txt-btn-addsvc").innerText = t.addSvcBtn;
+      document.getElementById("th-proc-name").innerText = t.thProcName;
+      document.getElementById("th-proc-user").innerText = t.thProcUser;
     }}
 
     function toggleLang() {{
@@ -631,6 +1026,8 @@ def render_html():
 
     function applyTheme() {{
       document.documentElement.setAttribute("data-theme", currentTheme);
+      drawSparkline("cpu-chart", cpuHistory, "#3b82f6");
+      drawSparkline("ram-chart", ramHistory, "#10b981");
     }}
 
     function toggleTheme() {{
@@ -644,6 +1041,18 @@ def render_html():
       el.innerText = msg;
       el.classList.add("show");
       setTimeout(() => el.classList.remove("show"), 3500);
+    }}
+
+    function changeInterval() {{
+      const val = parseInt(document.getElementById("refresh-rate").value);
+      currentInterval = val;
+      if (refreshTimer) clearInterval(refreshTimer);
+      if (val > 0) {{
+        refreshTimer = setInterval(loadAllData, val);
+        showToast("Автообновление: " + (val / 1000) + " сек");
+      }} else {{
+        showToast("Автообновление приостановлено");
+      }}
     }}
 
     async function loadSystemStats() {{
@@ -661,12 +1070,20 @@ def render_html():
         cpuBar.style.width = `${{data.cpu_pct}}%`;
         cpuBar.className = "progress-fill" + (data.cpu_pct > 80 ? " danger" : data.cpu_pct > 50 ? " warning" : "");
 
+        cpuHistory.push(data.cpu_pct);
+        if (cpuHistory.length > 25) cpuHistory.shift();
+        drawSparkline("cpu-chart", cpuHistory, "#3b82f6");
+
         document.getElementById("ram-pct").innerText = `${{data.ram.pct}}%`;
         document.getElementById("ram-used").innerText = `${{data.ram.used_mb}} MB`;
         document.getElementById("ram-sub").innerText = `${{data.ram.pct}}% of ${{data.ram.total_mb}} MB (${{data.ram.free_mb}} MB free)`;
         const ramBar = document.getElementById("ram-bar");
         ramBar.style.width = `${{data.ram.pct}}%`;
         ramBar.className = "progress-fill" + (data.ram.pct > 85 ? " danger" : data.ram.pct > 65 ? " warning" : "");
+
+        ramHistory.push(data.ram.pct);
+        if (ramHistory.length > 25) ramHistory.shift();
+        drawSparkline("ram-chart", ramHistory, "#10b981");
 
         document.getElementById("swap-pct").innerText = `${{data.swap.pct}}%`;
         document.getElementById("swap-used").innerText = `${{data.swap.used_mb}} MB`;
@@ -679,6 +1096,48 @@ def render_html():
         const diskBar = document.getElementById("disk-bar");
         diskBar.style.width = `${{data.disk.pct}}%`;
         diskBar.className = "progress-fill" + (data.disk.pct > 85 ? " danger" : "");
+
+        // Network
+        if (data.network) {{
+          document.getElementById("net-speed").innerText = `⬇️ ${{data.network.rx_rate_kb}} KB/s`;
+          document.getElementById("net-tx-speed").innerText = `⬆️ ${{data.network.tx_rate_kb}} KB/s`;
+          document.getElementById("net-totals").innerText = `Всего: ⬇️ ${{data.network.total_rx_gb}} GB | ⬆️ ${{data.network.total_tx_gb}} GB`;
+        }}
+
+        // Top Processes
+        if (data.top_processes) {{
+          const tbody = document.getElementById("top-processes-tbody");
+          tbody.innerHTML = "";
+          data.top_processes.forEach(pr => {{
+            const tr = document.createElement("tr");
+            tr.style.borderBottom = "1px solid var(--card-border)";
+            tr.innerHTML = `
+              <td style="padding: 6px 8px; font-family: monospace;">${{pr.pid}}</td>
+              <td style="padding: 6px 8px; font-weight: 600;">${{pr.name}}</td>
+              <td style="padding: 6px 8px; color: var(--text-muted);">${{pr.user}}</td>
+              <td style="padding: 6px 8px; font-weight: 600; color: var(--accent);">${{pr.cpu}}%</td>
+              <td style="padding: 6px 8px; font-weight: 600; color: var(--warning);">${{pr.mem}}%</td>
+            `;
+            tbody.appendChild(tr);
+          }});
+        }}
+
+        // Audit Log
+        if (data.audit_log) {{
+          const auditList = document.getElementById("audit-logins-list");
+          auditList.innerHTML = "";
+          data.audit_log.forEach(a => {{
+            const div = document.createElement("div");
+            div.className = "ip-item";
+            div.innerHTML = `
+              <div>
+                <span style="color: var(--success); font-weight: 600;">👤 ${{a.user}}</span> from <b>${{a.ip}}</b>
+                <div style="font-size: 0.75rem; color: var(--text-muted);">${{a.time}} (${{a.duration}})</div>
+              </div>
+            `;
+            auditList.appendChild(div);
+          }});
+        }}
       }} catch (e) {{
         console.error("System stats error:", e);
       }}
@@ -712,10 +1171,11 @@ def render_html():
             </div>
             <div class="project-actions">
               ${{p.services.length > 0 ? `
-                <button class="btn btn-sm btn-primary" onclick="serviceAction('${{p.services[0]}}', 'restart')">${{t.restart}}</button>
+                <button class="btn btn-sm btn-outline" onclick="openLogsModal('${{p.primary_service}}')">📜 Логи</button>
+                <button class="btn btn-sm btn-primary" onclick="serviceAction('${{p.primary_service}}', 'restart')">${{t.restart}}</button>
                 ${{p.status === 'active'
-                  ? `<button class="btn btn-sm btn-danger" onclick="serviceAction('${{p.services[0]}}', 'stop')">${{t.stop}}</button>`
-                  : `<button class="btn btn-sm btn-success" onclick="serviceAction('${{p.services[0]}}', 'start')">${{t.start}}</button>`
+                  ? `<button class="btn btn-sm btn-danger" onclick="serviceAction('${{p.primary_service}}', 'stop')">${{t.stop}}</button>`
+                  : `<button class="btn btn-sm btn-success" onclick="serviceAction('${{p.primary_service}}', 'start')">${{t.start}}</button>`
                 }}
               ` : ''}}
             </div>
@@ -788,6 +1248,31 @@ def render_html():
         }}
       }} catch (e) {{
         showToast("Ошибка сети: " + e.message);
+      }}
+    }}
+
+    async function customBan() {{
+      const ip = document.getElementById("custom-ban-ip").value.trim();
+      if (!ip) {{
+        showToast("Введите корректный IP-адрес");
+        return;
+      }}
+      try {{
+        showToast("Блокировка IP " + ip + "...");
+        const data = await apiFetch("/api/security/ban", {{
+          method: "POST",
+          headers: {{ "Content-Type": "application/json" }},
+          body: JSON.stringify({{ ip }})
+        }});
+        if (data.success) {{
+          showToast("IP " + ip + " успешно заблокирован");
+          document.getElementById("custom-ban-ip").value = "";
+          loadSecurity();
+        }} else {{
+          showToast("Ошибка: " + data.error);
+        }}
+      }} catch (e) {{
+        showToast("Ошибка сети");
       }}
     }}
 
@@ -875,6 +1360,101 @@ def render_html():
       }}
     }}
 
+    async function updateSelf() {{
+      if (!confirm("Обновить саму веб-панель из GitHub репозитория Skverna84/vps-dashboard?")) return;
+      showToast("Загрузка обновления панели...");
+      try {{
+        const data = await apiFetch("/api/update/self", {{ method: "POST" }});
+        if (data.success) {{
+          showToast("Панель обновлена! Перезагрузка страницы...");
+          setTimeout(() => location.reload(), 2500);
+        }} else {{
+          showToast("Ошибка обновления: " + data.error);
+        }}
+      }} catch (e) {{
+        showToast("Панель перезапускается...");
+        setTimeout(() => location.reload(), 2500);
+      }}
+    }}
+
+    function downloadBackup() {{
+      showToast("Формирование бэкапа...");
+      window.location.href = "/api/backup";
+    }}
+
+    async function openLogsModal(svc) {{
+      activeLogService = svc;
+      document.getElementById("logs-modal-title").innerText = "📜 Логи службы: " + svc;
+      document.getElementById("logs-modal").classList.add("active");
+      const term = document.getElementById("logs-modal-terminal");
+      term.innerText = "Загрузка журнала " + svc + "...";
+      try {{
+        const data = await apiFetch("/api/service/logs?service=" + svc);
+        term.innerText = data.logs;
+        term.scrollTop = term.scrollHeight;
+      }} catch (e) {{
+        term.innerText = "Ошибка загрузки логов: " + e.message;
+      }}
+    }}
+
+    function closeLogsModal() {{
+      document.getElementById("logs-modal").classList.remove("active");
+    }}
+
+    function refreshCurrentLogs() {{
+      if (activeLogService) openLogsModal(activeLogService);
+    }}
+
+    async function openPortsModal() {{
+      document.getElementById("ports-modal").classList.add("active");
+      const tbody = document.getElementById("ports-modal-tbody");
+      tbody.innerHTML = "<tr><td colspan='4' style='padding: 1rem; text-align: center;'>Загрузка портов...</td></tr>";
+      try {{
+        const data = await apiFetch("/api/system");
+        tbody.innerHTML = "";
+        if (data.listening_ports) {{
+          data.listening_ports.forEach(p => {{
+            const tr = document.createElement("tr");
+            tr.style.borderBottom = "1px solid var(--card-border)";
+            tr.innerHTML = `
+              <td style="padding: 6px 8px;"><span class="badge badge-info">${{p.proto}}</span></td>
+              <td style="padding: 6px 8px; font-weight: 700; color: var(--accent);">${{p.port}}</td>
+              <td style="padding: 6px 8px; font-family: monospace;">${{p.address}}</td>
+              <td style="padding: 6px 8px; font-weight: 600;">${{p.process}}</td>
+            `;
+            tbody.appendChild(tr);
+          }});
+        }}
+      }} catch (e) {{
+        tbody.innerHTML = "<tr><td colspan='4' style='color: var(--danger); padding: 1rem;'>Ошибка загрузки</td></tr>";
+      }}
+    }}
+
+    function closePortsModal() {{
+      document.getElementById("ports-modal").classList.remove("active");
+    }}
+
+    async function addCustomService() {{
+      const svc = prompt("Введите имя systemd-службы (например, wireguard, cron, ufw):");
+      if (!svc) return;
+      try {{
+        showToast("Добавление службы " + svc + "...");
+        const data = await apiFetch("/api/service/add", {{
+          method: "POST",
+          headers: {{ "Content-Type": "application/json" }},
+          body: JSON.stringify({{ service: svc.trim() }})
+        }});
+        if (data.success) {{
+          showToast("Служба добавлена!");
+          loadProjects();
+        }} else {{
+          showToast("Ошибка: " + data.error);
+        }}
+      }} catch (e) {{
+        showToast("Ошибка сети");
+      }}
+    }}
+
     function loadAllData() {{
       loadSystemStats();
       loadProjects();
@@ -883,8 +1463,9 @@ def render_html():
 
     applyTheme();
     applyLang();
-    setInterval(loadSystemStats, 3000);
-    setInterval(loadSecurity, 6000);
+    drawSparkline("cpu-chart", cpuHistory, "#3b82f6");
+    drawSparkline("ram-chart", ramHistory, "#10b981");
+    refreshTimer = setInterval(loadAllData, currentInterval);
   </script>
 </body>
 </html>
@@ -926,6 +1507,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(b"Unauthorized")
 
+    def do_HEAD(self):
+        self.do_GET()
+
     def do_GET(self):
         if not self.check_auth():
             return self.require_auth()
@@ -964,6 +1548,55 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.send_json(data)
             return
 
+        elif path == "/api/service/logs":
+            qs = parse_qs(urlparse(self.path).query)
+            service = qs.get("service", [""])[0].strip()
+            custom_svcs = CONFIG.get("custom_services", [])
+            allowed_services = ["rustdesksignal", "rustdeskrelay", "gohttpserver", "docker", "nginx", "fail2ban", "vps-dashboard", "ssh"] + custom_svcs
+
+            if service in allowed_services:
+                code, out, err = run_cmd(f"journalctl -u {service}.service -n 100 --no-pager", timeout=10)
+                self.send_json({"service": service, "logs": out or err or "No logs available."})
+            else:
+                self.send_json({"error": "Invalid service"}, status=HTTPStatus.BAD_REQUEST)
+            return
+
+        elif path == "/api/backup":
+            now_str = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            filename = f"vps_backup_{now_str}.tar.gz"
+            tmp_tar = tempfile.NamedTemporaryFile(suffix=".tar.gz", delete=False)
+            tmp_tar.close()
+
+            paths_to_backup = [
+                "/opt/vps-dashboard/config.json",
+                "/etc/systemd/system/vps-dashboard.service",
+                "/opt/rustdesk/db_v2.sqlite3",
+                "/opt/rustdesk/id_ed25519",
+                "/opt/rustdesk/id_ed25519.pub",
+                "/etc/fail2ban/jail.local",
+                "/etc/nginx/sites-available",
+                "/etc/nginx/sites-enabled"
+            ]
+            with tarfile.open(tmp_tar.name, "w:gz") as tar:
+                for p in paths_to_backup:
+                    if os.path.exists(p):
+                        tar.add(p, arcname=p.lstrip("/"))
+
+            with open(tmp_tar.name, "rb") as f:
+                content = f.read()
+            try:
+                os.unlink(tmp_tar.name)
+            except Exception:
+                pass
+
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "application/gzip")
+            self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+            self.send_header("Content-Length", str(len(content)))
+            self.end_headers()
+            self.wfile.write(content)
+            return
+
         else:
             self.send_error(HTTPStatus.NOT_FOUND, "Not Found")
 
@@ -983,7 +1616,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
         if path == "/api/service/action":
             svc = payload.get("service")
             act = payload.get("action")
-            allowed_services = ["rustdesksignal", "rustdeskrelay", "gohttpserver", "docker", "nginx", "fail2ban", "ssh"]
+            custom_svcs = CONFIG.get("custom_services", [])
+            allowed_services = ["rustdesksignal", "rustdeskrelay", "gohttpserver", "docker", "nginx", "fail2ban", "ssh", "vps-dashboard"] + custom_svcs
             allowed_actions = ["start", "stop", "restart", "reload"]
 
             if svc in allowed_services and act in allowed_actions:
@@ -994,6 +1628,31 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     self.send_json({"success": False, "error": err or out})
             else:
                 self.send_json({"success": False, "error": "Invalid service or action"})
+            return
+
+        elif path == "/api/service/add":
+            svc = payload.get("service", "").strip()
+            if svc and svc.isalnum() or "-" in svc or "_" in svc:
+                custom_svcs = CONFIG.get("custom_services", [])
+                if svc not in custom_svcs:
+                    custom_svcs.append(svc)
+                    CONFIG["custom_services"] = custom_svcs
+                    save_config(CONFIG)
+                self.send_json({"success": True, "message": f"Service {svc} added"})
+            else:
+                self.send_json({"success": False, "error": "Invalid service name"})
+            return
+
+        elif path == "/api/security/ban":
+            ip = payload.get("ip", "").strip()
+            if ip:
+                code, out, err = run_cmd(f"fail2ban-client set sshd banip {ip}")
+                if code == 0:
+                    self.send_json({"success": True, "message": f"IP {ip} banned"})
+                else:
+                    self.send_json({"success": False, "error": err or out})
+            else:
+                self.send_json({"success": False, "error": "IP is required"})
             return
 
         elif path == "/api/security/unban":
@@ -1043,12 +1702,32 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 self.send_json({"success": False, "error": err or out})
             return
 
+        elif path == "/api/update/self":
+            cmd = """
+            curl -sSL "https://raw.githubusercontent.com/Skverna84/vps-dashboard/main/app.py" -o /tmp/app_new.py
+            python3 -m py_compile /tmp/app_new.py
+            if [ $? -eq 0 ]; then
+                cp /tmp/app_new.py /opt/vps-dashboard/app.py
+                chmod +x /opt/vps-dashboard/app.py
+                echo "SUCCESS"
+                (sleep 1 && systemctl restart vps-dashboard.service) &
+            else
+                echo "COMPILE_ERROR"
+            fi
+            """
+            code, out, err = run_cmd(cmd, timeout=30)
+            if "SUCCESS" in out:
+                self.send_json({"success": True, "message": "Dashboard updated and restarting"})
+            else:
+                self.send_json({"success": False, "error": err or out})
+            return
+
         else:
             self.send_error(HTTPStatus.NOT_FOUND, "Not Found")
 
-    def send_json(self, data):
+    def send_json(self, data, status=HTTPStatus.OK):
         body = json.dumps(data, ensure_ascii=False).encode("utf-8")
-        self.send_response(HTTPStatus.OK)
+        self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
@@ -1061,7 +1740,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
 def main():
     port = CONFIG.get("port", 8080)
     server = ThreadingHTTPServer(("0.0.0.0", port), DashboardHandler)
-    print(f"VPS Dashboard running on port {port}...")
+    print(f"VPS Dashboard v{VERSION} running on port {port}...")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
