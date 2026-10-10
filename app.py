@@ -17,11 +17,12 @@ import tempfile
 import datetime
 import platform
 import subprocess
+import urllib.request
 from urllib.parse import urlparse, parse_qs
 from http import HTTPStatus
 from http.server import HTTPServer, ThreadingHTTPServer, BaseHTTPRequestHandler
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
 
 def load_config():
@@ -60,6 +61,68 @@ NET_STATE = {
     "total_rx_mb": 0.0,
     "total_tx_mb": 0.0,
 }
+
+# Global in-memory GeoIP cache to avoid repeated external lookups
+GEOIP_CACHE = {}
+
+def country_code_to_flag(code):
+    if not code or len(code) != 2:
+        return "🌐"
+    code = code.upper()
+    try:
+        return chr(127397 + ord(code[0])) + chr(127397 + ord(code[1]))
+    except Exception:
+        return "🌐"
+
+def resolve_geoip(ip):
+    if not ip or ip in ("127.0.0.1", "localhost", "::1"):
+        return {"country": "Local", "country_code": "LOC", "flag": "🏠"}
+    if ip.startswith("10.") or ip.startswith("192.168.") or ip.startswith("172.16.") or ip.startswith("172.17."):
+        return {"country": "LAN / Private", "country_code": "LAN", "flag": "🔒"}
+
+    if ip in GEOIP_CACHE:
+        return GEOIP_CACHE[ip]
+
+    try:
+        url = f"http://ip-api.com/json/{ip}?fields=status,country,countryCode"
+        req = urllib.request.Request(url, headers={"User-Agent": "VPS-Dashboard/1.2.0"})
+        with urllib.request.urlopen(req, timeout=2.0) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            if data.get("status") == "success":
+                cname = data.get("country", "Unknown")
+                ccode = data.get("countryCode", "")
+                res = {
+                    "country": cname,
+                    "country_code": ccode,
+                    "flag": country_code_to_flag(ccode)
+                }
+                GEOIP_CACHE[ip] = res
+                return res
+    except Exception:
+        pass
+
+    fallback = {"country": "Unknown", "country_code": "UN", "flag": "🌐"}
+    GEOIP_CACHE[ip] = fallback
+    return fallback
+
+def get_docker_containers():
+    code, out, _ = run_cmd("docker ps -a --format '{{.ID}}|{{.Names}}|{{.Image}}|{{.Status}}|{{.State}}|{{.Ports}}'")
+    containers = []
+    if code == 0 and out:
+        for line in out.splitlines():
+            parts = line.split("|")
+            if len(parts) >= 6:
+                cid, name, image, status_str, state, ports = parts[0], parts[1], parts[2], parts[3], parts[4], parts[5]
+                containers.append({
+                    "id": cid,
+                    "name": name,
+                    "image": image,
+                    "status_str": status_str,
+                    "state": state.lower(),
+                    "ports": ports or "-",
+                    "is_running": (state.lower() == "running")
+                })
+    return containers
 
 def run_cmd(cmd, timeout=15):
     try:
@@ -319,9 +382,9 @@ def get_projects_status():
     _, doc_ver, _ = run_cmd("docker --version 2>&1 | awk '{print $3}' | tr -d ','")
     doc_version = doc_ver.strip() if doc_ver else "29.1.3"
 
-    # Check docker containers count
-    _, doc_cnt, _ = run_cmd("docker ps -q 2>/dev/null | wc -l")
-    doc_running = int(doc_cnt.strip()) if doc_cnt.strip().isdigit() else 0
+    containers = get_docker_containers()
+    doc_running = len([c for c in containers if c["is_running"]])
+    doc_total = len(containers)
 
     projects.append({
         "id": "docker",
@@ -333,7 +396,8 @@ def get_projects_status():
         "update_available": False,
         "services": ["docker"],
         "primary_service": "docker",
-        "ports": [f"{doc_running} активных контейнеров"],
+        "ports": [f"{doc_running}/{doc_total} активных контейнеров"],
+        "containers": containers,
         "description": "Среда контейнеризации Docker"
     })
 
@@ -397,7 +461,17 @@ def get_projects_status():
 
 def get_security_status():
     _, banned_str, _ = run_cmd("fail2ban-client status sshd 2>/dev/null | grep 'Banned IP list:' | cut -d: -f2")
-    banned_ips = [ip.strip() for ip in banned_str.split() if ip.strip()]
+    raw_banned = [ip.strip() for ip in banned_str.split() if ip.strip()]
+
+    banned_ips = []
+    for ip in raw_banned:
+        geo = resolve_geoip(ip)
+        banned_ips.append({
+            "ip": ip,
+            "country": geo.get("country", "Unknown"),
+            "country_code": geo.get("country_code", "UN"),
+            "flag": geo.get("flag", "🌐")
+        })
 
     _, lastb_out, _ = run_cmd("lastb -n 12 2>/dev/null")
     failed_logins = []
@@ -407,10 +481,14 @@ def get_security_status():
             user = parts[0]
             ip = parts[2]
             date_time = " ".join(parts[3:7])
+            geo = resolve_geoip(ip)
             failed_logins.append({
                 "user": user,
                 "ip": ip,
-                "time": date_time
+                "time": date_time,
+                "country": geo.get("country", "Unknown"),
+                "country_code": geo.get("country_code", "UN"),
+                "flag": geo.get("flag", "🌐")
             })
 
     return {
@@ -442,10 +520,15 @@ def render_html():
         status_badge = '<span class="badge badge-success">Active</span>' if p["status"] == "active" else '<span class="badge badge-danger">Stopped</span>'
         update_badge = '<button class="btn btn-sm btn-warning" onclick="updateRustDesk()">Обновить (1.1.16)</button>' if p["update_available"] else f'<span class="badge badge-info">Актуально (v{p["installed_version"]})</span>'
         actions_html = ""
+
+        # Special button for Docker to open containers manager
+        if p["id"] == "docker":
+            actions_html += '<button class="btn btn-sm btn-primary" onclick="openDockerModal()">🐳 Контейнеры</button> '
+
         if p["services"]:
             s0 = p["primary_service"]
             stop_start = f'<button class="btn btn-sm btn-danger" onclick="serviceAction(\'{s0}\', \'stop\')">Остановить</button>' if p["status"] == "active" else f'<button class="btn btn-sm btn-success" onclick="serviceAction(\'{s0}\', \'start\')">Запустить</button>'
-            actions_html = f"""
+            actions_html += f"""
             <button class="btn btn-sm btn-outline" onclick="openLogsModal('{s0}')">📜 Логи</button>
             <button class="btn btn-sm btn-primary" onclick="serviceAction('{s0}', 'restart')">Перезапуск</button>
             {stop_start}
@@ -466,10 +549,13 @@ def render_html():
     if not sec_data["banned_ips"]:
         banned_html = '<div style="color: var(--text-muted); font-size: 0.8rem;">Нет активных банов</div>'
     else:
-        for ip in sec_data["banned_ips"]:
+        for b in sec_data["banned_ips"]:
+            ip = b["ip"]
+            flag = b.get("flag", "🌐")
+            country = b.get("country", "")
             banned_html += f"""
             <div class="ip-item">
-              <span>🚫 <b>{ip}</b></span>
+              <span>{flag} <b>{ip}</b> <span style="font-size: 0.72rem; color: var(--text-muted);">({country})</span></span>
               <button class="btn btn-sm btn-danger" onclick="unbanIp('{ip}')">Разблокировать</button>
             </div>
             """
@@ -480,10 +566,12 @@ def render_html():
         attacks_html = '<div style="color: var(--text-muted); font-size: 0.8rem;">Нет атак в журнале</div>'
     else:
         for f in sec_data["failed_attempts"]:
+            flag = f.get("flag", "🌐")
+            country = f.get("country", "")
             attacks_html += f"""
             <div class="ip-item">
               <div>
-                <span style="color: var(--danger); font-weight: 600;">{f['user']}</span> from <b>{f['ip']}</b>
+                <span style="color: var(--danger); font-weight: 600;">{f['user']}</span> from <b>{f['ip']}</b> {flag} <span style="font-size: 0.72rem; color: var(--text-muted);">({country})</span>
                 <div style="font-size: 0.75rem; color: var(--text-muted);">{f['time']}</div>
               </div>
             </div>
@@ -850,6 +938,37 @@ def render_html():
     </div>
   </div>
 
+  <!-- Modal: Docker Containers Manager -->
+  <div class="modal-overlay" id="docker-modal">
+    <div class="modal-content" style="max-width: 860px;">
+      <div class="modal-header">
+        <h3 style="font-size: 1.1rem;" id="txt-docker-modal-title">🐳 Управление контейнерами Docker</h3>
+        <button class="btn btn-sm btn-outline" onclick="closeDockerModal()">✕</button>
+      </div>
+      <div class="modal-body">
+        <div id="docker-modal-content">
+          <table style="width: 100%; text-align: left; font-size: 0.82rem; border-collapse: collapse;">
+            <thead>
+              <tr style="border-bottom: 1px solid var(--card-border); color: var(--text-muted);">
+                <th style="padding: 8px;">Имя</th>
+                <th style="padding: 8px;">Образ</th>
+                <th style="padding: 8px;">Статус</th>
+                <th style="padding: 8px;">Порты</th>
+                <th style="padding: 8px; text-align: right;">Действия</th>
+              </tr>
+            </thead>
+            <tbody id="docker-modal-tbody">
+            </tbody>
+          </table>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn-outline" onclick="refreshDockerModal()">🔄 Обновить</button>
+        <button class="btn btn-primary" onclick="closeDockerModal()">Закрыть</button>
+      </div>
+    </div>
+  </div>
+
   <div id="toast">Уведомление</div>
 
   <script>
@@ -1015,6 +1134,8 @@ def render_html():
       document.getElementById("txt-btn-addsvc").innerText = t.addSvcBtn;
       document.getElementById("th-proc-name").innerText = t.thProcName;
       document.getElementById("th-proc-user").innerText = t.thProcUser;
+      const dTitle = document.getElementById("txt-docker-modal-title");
+      if (dTitle) dTitle.innerText = (currentLang === "ru") ? "🐳 Управление контейнерами Docker" : "🐳 Docker Containers Manager";
     }}
 
     function toggleLang() {{
@@ -1162,6 +1283,11 @@ def render_html():
             ? `<button class="btn btn-sm btn-warning" onclick="updateRustDesk()">${{t.updateAvail}} (1.1.16)</button>`
             : `<span class="badge badge-info">${{t.uptodate}} (v${{p.installed_version}})</span>`;
 
+          let extraBtns = "";
+          if (p.id === "docker") {{
+            extraBtns = `<button class="btn btn-sm btn-primary" onclick="openDockerModal()">🐳 Контейнеры</button> `;
+          }}
+
           div.innerHTML = `
             <div class="project-info">
               <div class="project-name">
@@ -1170,6 +1296,7 @@ def render_html():
               <div class="project-desc">${{p.description}} | Порты: ${{p.ports.join(", ")}}</div>
             </div>
             <div class="project-actions">
+              ${{extraBtns}}
               ${{p.services.length > 0 ? `
                 <button class="btn btn-sm btn-outline" onclick="openLogsModal('${{p.primary_service}}')">📜 Логи</button>
                 <button class="btn btn-sm btn-primary" onclick="serviceAction('${{p.primary_service}}', 'restart')">${{t.restart}}</button>
@@ -1199,11 +1326,14 @@ def render_html():
         if (sec.banned_ips.length === 0) {{
           bannedList.innerHTML = `<div style="color: var(--text-muted); font-size: 0.8rem;">${{t.noBans}}</div>`;
         }} else {{
-          sec.banned_ips.forEach(ip => {{
+          sec.banned_ips.forEach(b => {{
+            const ip = b.ip || b;
+            const flag = b.flag || "🌐";
+            const country = b.country || "";
             const div = document.createElement("div");
             div.className = "ip-item";
             div.innerHTML = `
-              <span>🚫 <b>${{ip}}</b></span>
+              <span>${{flag}} <b>${{ip}}</b> <span style="font-size: 0.72rem; color: var(--text-muted);">(${{country}})</span></span>
               <button class="btn btn-sm btn-danger" onclick="unbanIp('${{ip}}')">${{t.unban}}</button>
             `;
             bannedList.appendChild(div);
@@ -1216,11 +1346,13 @@ def render_html():
           failedList.innerHTML = `<div style="color: var(--text-muted); font-size: 0.8rem;">Нет атак в журнале</div>`;
         }} else {{
           sec.failed_attempts.forEach(f => {{
+            const flag = f.flag || "🌐";
+            const country = f.country || "";
             const div = document.createElement("div");
             div.className = "ip-item";
             div.innerHTML = `
               <div>
-                <span style="color: var(--danger); font-weight: 600;">${{f.user}}</span> from <b>${{f.ip}}</b>
+                <span style="color: var(--danger); font-weight: 600;">${{f.user}}</span> from <b>${{f.ip}}</b> ${{flag}} <span style="font-size: 0.72rem; color: var(--text-muted);">(${{country}})</span>
                 <div style="font-size: 0.75rem; color: var(--text-muted);">${{f.time}}</div>
               </div>
             `;
@@ -1434,6 +1566,87 @@ def render_html():
       document.getElementById("ports-modal").classList.remove("active");
     }}
 
+    async function openDockerModal() {{
+      document.getElementById("docker-modal").classList.add("active");
+      refreshDockerModal();
+    }}
+
+    function closeDockerModal() {{
+      document.getElementById("docker-modal").classList.remove("active");
+    }}
+
+    async function refreshDockerModal() {{
+      const tbody = document.getElementById("docker-modal-tbody");
+      tbody.innerHTML = "<tr><td colspan='5' style='padding: 1rem; text-align: center;'>Загрузка контейнеров...</td></tr>";
+      try {{
+        const containers = await apiFetch("/api/docker/containers");
+        tbody.innerHTML = "";
+        if (!containers || containers.length === 0) {{
+          tbody.innerHTML = "<tr><td colspan='5' style='padding: 1.5rem; text-align: center; color: var(--text-muted);'>Нет созданных контейнеров Docker</td></tr>";
+          return;
+        }}
+        containers.forEach(c => {{
+          const tr = document.createElement("tr");
+          tr.style.borderBottom = "1px solid var(--card-border)";
+          const statusBadge = c.is_running
+            ? `<span class="badge badge-success">Running</span>`
+            : `<span class="badge badge-danger">Stopped</span>`;
+          const actionBtn = c.is_running
+            ? `<button class="btn btn-sm btn-danger" onclick="dockerAction('${{c.name}}', 'stop')">Остановить</button>`
+            : `<button class="btn btn-sm btn-success" onclick="dockerAction('${{c.name}}', 'start')">Запустить</button>`;
+
+          tr.innerHTML = `
+            <td style="padding: 8px; font-weight: 600;">🐳 ${{c.name}}</td>
+            <td style="padding: 8px; font-family: monospace; font-size: 0.75rem; color: var(--text-muted);">${{c.image}}</td>
+            <td style="padding: 8px;">${{statusBadge}} <span style="font-size: 0.72rem; color: var(--text-muted);">${{c.status_str}}</span></td>
+            <td style="padding: 8px; font-size: 0.75rem; font-family: monospace;">${{c.ports}}</td>
+            <td style="padding: 8px; text-align: right;">
+              <button class="btn btn-sm btn-outline" onclick="openDockerLogsModal('${{c.name}}')">📜 Логи</button>
+              <button class="btn btn-sm btn-primary" onclick="dockerAction('${{c.name}}', 'restart')">Рестарт</button>
+              ${{actionBtn}}
+            </td>
+          `;
+          tbody.appendChild(tr);
+        }});
+      }} catch (e) {{
+        tbody.innerHTML = "<tr><td colspan='5' style='color: var(--danger); padding: 1rem;'>Ошибка загрузки: " + e.message + "</td></tr>";
+      }}
+    }}
+
+    async function dockerAction(container, action) {{
+      try {{
+        showToast("Docker: " + action + " " + container + "...");
+        const data = await apiFetch("/api/docker/action", {{
+          method: "POST",
+          headers: {{ "Content-Type": "application/json" }},
+          body: JSON.stringify({{ container, action }})
+        }});
+        if (data.success) {{
+          showToast("Успешно: " + container + " -> " + action);
+          refreshDockerModal();
+          loadProjects();
+        }} else {{
+          showToast("Ошибка: " + data.error);
+        }}
+      }} catch (e) {{
+        showToast("Ошибка сети");
+      }}
+    }}
+
+    async function openDockerLogsModal(container) {{
+      document.getElementById("logs-modal-title").innerText = "📜 Логи контейнера Docker: " + container;
+      document.getElementById("logs-modal").classList.add("active");
+      const term = document.getElementById("logs-modal-terminal");
+      term.innerText = "Загрузка журнала контейнера " + container + "...";
+      try {{
+        const data = await apiFetch("/api/docker/logs?container=" + container);
+        term.innerText = data.logs;
+        term.scrollTop = term.scrollHeight;
+      }} catch (e) {{
+        term.innerText = "Ошибка загрузки логов: " + e.message;
+      }}
+    }}
+
     async function addCustomService() {{
       const svc = prompt("Введите имя systemd-службы (например, wireguard, cron, ufw):");
       if (!svc) return;
@@ -1561,6 +1774,21 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 self.send_json({"error": "Invalid service"}, status=HTTPStatus.BAD_REQUEST)
             return
 
+        elif path == "/api/docker/logs":
+            qs = parse_qs(urlparse(self.path).query)
+            container = qs.get("container", [""])[0].strip()
+            if container and (container.isalnum() or "-" in container or "_" in container):
+                code, out, err = run_cmd(f"docker logs --tail 100 --timestamps {container}", timeout=10)
+                self.send_json({"container": container, "logs": out or err or "No logs available for container."})
+            else:
+                self.send_json({"error": "Invalid container name or id"}, status=HTTPStatus.BAD_REQUEST)
+            return
+
+        elif path == "/api/docker/containers":
+            containers = get_docker_containers()
+            self.send_json(containers)
+            return
+
         elif path == "/api/backup":
             now_str = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
             filename = f"vps_backup_{now_str}.tar.gz"
@@ -1628,6 +1856,20 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     self.send_json({"success": False, "error": err or out})
             else:
                 self.send_json({"success": False, "error": "Invalid service or action"})
+            return
+
+        elif path == "/api/docker/action":
+            container = payload.get("container", "").strip()
+            act = payload.get("action", "").strip()
+            allowed_actions = ["start", "stop", "restart"]
+            if container and act in allowed_actions:
+                code, out, err = run_cmd(f"docker {act} {container}")
+                if code == 0:
+                    self.send_json({"success": True, "message": f"Container {container} {act}ed"})
+                else:
+                    self.send_json({"success": False, "error": err or out})
+            else:
+                self.send_json({"success": False, "error": "Invalid container or action"})
             return
 
         elif path == "/api/service/add":
