@@ -1,0 +1,7 @@
+{
+  "port": 8080,
+  "username": "admin",
+  "password": "CHANGE_ME_SECURE_PASSWORD",
+  "title": "VPS Control & Monitor",
+  "refresh_interval_sec": 3
+}
