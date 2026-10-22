@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-VPS Control & Monitoring Dashboard v1.1.0
+VPS Control & Monitoring Dashboard v1.3.0
 Lightweight, zero-dependency management server using Python standard library.
 Features Server-Side Pre-rendering (SSR) + Client-Side Live Polling (CSR).
 GitHub: https://github.com/Skverna84/vps-dashboard
@@ -12,6 +12,7 @@ import time
 import json
 import base64
 import shutil
+import sqlite3
 import tarfile
 import tempfile
 import datetime
@@ -22,7 +23,7 @@ from urllib.parse import urlparse, parse_qs
 from http import HTTPStatus
 from http.server import HTTPServer, ThreadingHTTPServer, BaseHTTPRequestHandler
 
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
 
 def load_config():
@@ -123,6 +124,79 @@ def get_docker_containers():
                     "is_running": (state.lower() == "running")
                 })
     return containers
+
+def get_rustdesk_details():
+    pub_key_path = "/opt/rustdesk/id_ed25519.pub"
+    pub_key = ""
+    if os.path.exists(pub_key_path):
+        try:
+            with open(pub_key_path, "r", encoding="utf-8") as f:
+                pub_key = f.read().strip()
+        except Exception:
+            pass
+
+    server_ip = "185.189.13.52"
+
+    # Services status
+    code_sig, out_sig, _ = run_cmd("systemctl is-active rustdesksignal.service")
+    code_rel, out_rel, _ = run_cmd("systemctl is-active rustdeskrelay.service")
+
+    peers = []
+    db_path = "/opt/rustdesk/db_v2.sqlite3"
+    if os.path.exists(db_path):
+        try:
+            con = sqlite3.connect(db_path, timeout=3.0)
+            cur = con.cursor()
+            cur.execute("SELECT id, uuid, info, created_at FROM peer ORDER BY created_at DESC")
+            rows = cur.fetchall()
+            for r in rows:
+                pid, uuid_bytes, info_raw, created_at = r[0], r[1], r[2], r[3]
+                uuid_str = "-"
+                if isinstance(uuid_bytes, (bytes, bytearray)):
+                    try:
+                        uuid_str = uuid_bytes.decode("utf-8")
+                    except Exception:
+                        uuid_str = uuid_bytes.hex()
+                elif uuid_bytes:
+                    uuid_str = str(uuid_bytes)
+
+                ip_addr = "-"
+                if info_raw:
+                    try:
+                        info_data = json.loads(info_raw)
+                        ip_addr = info_data.get("ip", "-")
+                        if ip_addr.startswith("::ffff:"):
+                            ip_addr = ip_addr.replace("::ffff:", "")
+                    except Exception:
+                        pass
+
+                geo = resolve_geoip(ip_addr) if ip_addr != "-" else {"country": "", "flag": "💻"}
+                peers.append({
+                    "id": pid or "-",
+                    "uuid": uuid_str,
+                    "ip": ip_addr,
+                    "created_at": created_at or "-",
+                    "country": geo.get("country", ""),
+                    "flag": geo.get("flag", "💻")
+                })
+            con.close()
+        except Exception:
+            pass
+
+    config_string = f"host={server_ip},key={pub_key}"
+
+    return {
+        "server_ip": server_ip,
+        "public_key": pub_key,
+        "config_string": config_string,
+        "id_server": f"{server_ip}:21116",
+        "relay_server": f"{server_ip}:21117",
+        "api_server": f"http://{server_ip}:21114",
+        "signal_status": out_sig,
+        "relay_status": out_rel,
+        "peers_count": len(peers),
+        "peers": peers
+    }
 
 def run_cmd(cmd, timeout=15):
     try:
@@ -524,6 +598,10 @@ def render_html():
         # Special button for Docker to open containers manager
         if p["id"] == "docker":
             actions_html += '<button class="btn btn-sm btn-primary" onclick="openDockerModal()">🐳 Контейнеры</button> '
+
+        # Special button for RustDesk to open RustDesk GUI manager
+        if p["id"] == "rustdesk":
+            actions_html += '<button class="btn btn-sm btn-primary" onclick="openRustDeskModal()">🖥️ RustDesk</button> '
 
         if p["services"]:
             s0 = p["primary_service"]
@@ -965,6 +1043,77 @@ def render_html():
       <div class="modal-footer">
         <button class="btn btn-outline" onclick="refreshDockerModal()">🔄 Обновить</button>
         <button class="btn btn-primary" onclick="closeDockerModal()">Закрыть</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Modal: RustDesk Server GUI & Peers -->
+  <div class="modal-overlay" id="rustdesk-modal">
+    <div class="modal-content" style="max-width: 900px;">
+      <div class="modal-header">
+        <h3 style="font-size: 1.1rem;" id="txt-rd-modal-title">🖥️ Управление RustDesk Server</h3>
+        <button class="btn btn-sm btn-outline" onclick="closeRustDeskModal()">✕</button>
+      </div>
+      <div class="modal-body">
+        <!-- Client Setup & Keys Block -->
+        <div style="background: var(--bar-bg); padding: 1rem; border-radius: 10px; margin-bottom: 1.2rem;">
+          <div style="font-weight: 600; font-size: 0.95rem; margin-bottom: 0.6rem; display: flex; align-items: center; justify-content: space-between;">
+            <span id="txt-rd-cfg-title">📋 Параметры подключения клиентов (Client Setup)</span>
+            <button class="btn btn-sm btn-primary" onclick="copyConfigString()">📋 Скопировать готовую строку</button>
+          </div>
+          <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 0.8rem; font-size: 0.82rem;">
+            <div>
+              <div style="color: var(--text-muted); margin-bottom: 2px;">ID / Rendezvous Server:</div>
+              <div style="display: flex; gap: 4px;">
+                <input type="text" id="rd-id-server" class="text-input" readonly style="flex: 1; font-family: monospace;">
+                <button class="btn btn-sm btn-outline" onclick="copyField('rd-id-server')">📋</button>
+              </div>
+            </div>
+            <div>
+              <div style="color: var(--text-muted); margin-bottom: 2px;">Relay Server:</div>
+              <div style="display: flex; gap: 4px;">
+                <input type="text" id="rd-relay-server" class="text-input" readonly style="flex: 1; font-family: monospace;">
+                <button class="btn btn-sm btn-outline" onclick="copyField('rd-relay-server')">📋</button>
+              </div>
+            </div>
+          </div>
+          <div style="margin-top: 0.8rem; font-size: 0.82rem;">
+            <div style="color: var(--text-muted); margin-bottom: 2px;">Public Key (Шифрование):</div>
+            <div style="display: flex; gap: 4px;">
+              <input type="text" id="rd-pub-key" class="text-input" readonly style="flex: 1; font-family: monospace;">
+              <button class="btn btn-sm btn-outline" onclick="copyField('rd-pub-key')">📋</button>
+            </div>
+          </div>
+        </div>
+
+        <!-- Peers List Table -->
+        <div>
+          <div style="font-weight: 600; font-size: 0.95rem; margin-bottom: 0.6rem; display: flex; align-items: center; justify-content: space-between;">
+            <span id="txt-rd-peers-title">👥 Зарегистрированные устройства (Peers)</span>
+            <span class="badge badge-info" id="rd-peers-count">0 устройств</span>
+          </div>
+          <div style="max-height: 280px; overflow-y: auto;">
+            <table style="width: 100%; text-align: left; font-size: 0.82rem; border-collapse: collapse;">
+              <thead>
+                <tr style="border-bottom: 1px solid var(--card-border); color: var(--text-muted);">
+                  <th style="padding: 8px;">Device ID</th>
+                  <th style="padding: 8px;">IP / Локация</th>
+                  <th style="padding: 8px;">UUID</th>
+                  <th style="padding: 8px; text-align: right;">Действие</th>
+                </tr>
+              </thead>
+              <tbody id="rd-peers-tbody">
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn-outline" onclick="openLogsModal('rustdesksignal')">📜 Логи Signal</button>
+        <button class="btn btn-outline" onclick="openLogsModal('rustdeskrelay')">📜 Логи Relay</button>
+        <button class="btn btn-primary" onclick="restartRustDeskBoth()">🔄 Перезапустить оба</button>
+        <button class="btn btn-outline" onclick="refreshRustDeskData()">🔄 Обновить</button>
+        <button class="btn btn-primary" onclick="closeRustDeskModal()">Закрыть</button>
       </div>
     </div>
   </div>
@@ -1647,6 +1796,109 @@ def render_html():
       }}
     }}
 
+    // --- RustDesk GUI Functions ---
+    async function openRustDeskModal() {{
+      document.getElementById("rustdesk-modal").classList.add("active");
+      refreshRustDeskData();
+    }}
+
+    function closeRustDeskModal() {{
+      document.getElementById("rustdesk-modal").classList.remove("active");
+    }}
+
+    let cachedRustDeskConfig = "";
+
+    async function refreshRustDeskData() {{
+      try {{
+        const data = await apiFetch("/api/rustdesk/info");
+        document.getElementById("rd-id-server").value = data.id_server || "";
+        document.getElementById("rd-relay-server").value = data.relay_server || "";
+        document.getElementById("rd-pub-key").value = data.public_key || "";
+        document.getElementById("rd-peers-count").innerText = `${{data.peers_count}} устройств`;
+        cachedRustDeskConfig = data.config_string || "";
+
+        const tbody = document.getElementById("rd-peers-tbody");
+        tbody.innerHTML = "";
+        if (!data.peers || data.peers.length === 0) {{
+          tbody.innerHTML = "<tr><td colspan='4' style='padding: 1.5rem; text-align: center; color: var(--text-muted);'>Нет подключенных устройств</td></tr>";
+          return;
+        }}
+        data.peers.forEach(p => {{
+          const tr = document.createElement("tr");
+          tr.style.borderBottom = "1px solid var(--card-border)";
+          tr.innerHTML = `
+            <td style="padding: 8px; font-weight: 700; color: var(--accent);">💻 ${{p.id}}</td>
+            <td style="padding: 8px;">${{p.flag}} <b>${{p.ip}}</b> <span style="font-size: 0.72rem; color: var(--text-muted);">(${{p.country}})</span></td>
+            <td style="padding: 8px; font-family: monospace; font-size: 0.72rem; color: var(--text-muted);">${{p.uuid}}</td>
+            <td style="padding: 8px; text-align: right;">
+              <button class="btn btn-sm btn-danger" onclick="deleteRustDeskPeer('${{p.id}}')">Удалить</button>
+            </td>
+          `;
+          tbody.appendChild(tr);
+        }});
+      }} catch (e) {{
+        showToast("Ошибка загрузки данных RustDesk: " + e.message);
+      }}
+    }}
+
+    async function deleteRustDeskPeer(id) {{
+      if (!confirm(`Удалить устройство ID ${id} из базы RustDesk?`)) return;
+      try {{
+        showToast(`Удаление устройства ${id}...`);
+        const data = await apiFetch("/api/rustdesk/peer/delete", {{
+          method: "POST",
+          headers: {{ "Content-Type": "application/json" }},
+          body: JSON.stringify({{ id: id }})
+        }});
+        if (data.success) {{
+          showToast(`Устройство ${id} удалено`);
+          refreshRustDeskData();
+        }} else {{
+          showToast("Ошибка: " + data.error);
+        }}
+      }} catch (e) {{
+        showToast("Ошибка сети");
+      }}
+    }}
+
+    async function restartRustDeskBoth() {{
+      try {{
+        showToast("Перезапуск служб RustDesk (Signal + Relay)...");
+        await apiFetch("/api/service/action", {{
+          method: "POST",
+          headers: {{ "Content-Type": "application/json" }},
+          body: JSON.stringify({{ service: "rustdesksignal", action: "restart" }})
+        }});
+        await apiFetch("/api/service/action", {{
+          method: "POST",
+          headers: {{ "Content-Type": "application/json" }},
+          body: JSON.stringify({{ service: "rustdeskrelay", action: "restart" }})
+        }});
+        showToast("RustDesk успешно перезапущен!");
+        refreshRustDeskData();
+        loadProjects();
+      }} catch (e) {{
+        showToast("Ошибка перезапуска");
+      }}
+    }}
+
+    function copyConfigString() {{
+      if (cachedRustDeskConfig) {{
+        navigator.clipboard.writeText(cachedRustDeskConfig);
+        showToast("Строка конфигурации скопирована в буфер!");
+      }} else {{
+        showToast("Конфигурация еще не загружена");
+      }}
+    }}
+
+    function copyField(fieldId) {{
+      const el = document.getElementById(fieldId);
+      if (el && el.value) {{
+        navigator.clipboard.writeText(el.value);
+        showToast("Скопировано: " + el.value);
+      }}
+    }}
+
     async function addCustomService() {{
       const svc = prompt("Введите имя systemd-службы (например, wireguard, cron, ufw):");
       if (!svc) return;
@@ -1789,6 +2041,11 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.send_json(containers)
             return
 
+        elif path == "/api/rustdesk/info":
+            data = get_rustdesk_details()
+            self.send_json(data)
+            return
+
         elif path == "/api/backup":
             now_str = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
             filename = f"vps_backup_{now_str}.tar.gz"
@@ -1870,6 +2127,23 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     self.send_json({"success": False, "error": err or out})
             else:
                 self.send_json({"success": False, "error": "Invalid container or action"})
+            return
+
+        elif path == "/api/rustdesk/peer/delete":
+            pid = payload.get("id", "").strip()
+            db_path = "/opt/rustdesk/db_v2.sqlite3"
+            if pid and os.path.exists(db_path):
+                try:
+                    con = sqlite3.connect(db_path, timeout=3.0)
+                    cur = con.cursor()
+                    cur.execute("DELETE FROM peer WHERE id = ?", (pid,))
+                    con.commit()
+                    con.close()
+                    self.send_json({"success": True, "message": f"Peer {pid} deleted"})
+                except Exception as e:
+                    self.send_json({"success": False, "error": str(e)})
+            else:
+                self.send_json({"success": False, "error": "Invalid peer ID or database not found"})
             return
 
         elif path == "/api/service/add":
