@@ -125,6 +125,65 @@ def get_docker_containers():
                 })
     return containers
 
+def get_active_rustdesk_ips():
+    active_ips = set()
+    try:
+        code, out, _ = run_cmd("ss -tnp")
+        if code == 0 and out:
+            for line in out.splitlines():
+                if ("21116" in line or "21117" in line) and "ESTAB" in line:
+                    parts = line.split()
+                    if len(parts) >= 5:
+                        peer_ap = parts[4]
+                        ip = peer_ap.split(":")[-2] if "]:" in peer_ap else peer_ap.split(":")[0]
+                        ip = ip.replace("[::ffff:", "").replace("[", "").replace("]", "")
+                        if ip and ip != "127.0.0.1":
+                            active_ips.add(ip)
+    except Exception:
+        pass
+    return active_ips
+
+def get_rustdesk_peer_last_seen():
+    last_seen_map = {}
+    log_file = "/var/log/rustdesk/signalserver.log"
+    if os.path.exists(log_file):
+        try:
+            # Read last 5000 lines for efficiency
+            code, out, _ = run_cmd(f"tail -n 5000 {log_file} | tac", timeout=5)
+            if code == 0 and out:
+                import re
+                for line in out.splitlines():
+                    m = re.search(r"\[(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})[^\]]*\].*?\b(\d{7,10})\b", line)
+                    if m:
+                        ts, pid = m.group(1), m.group(2)
+                        if pid not in last_seen_map:
+                            last_seen_map[pid] = ts
+        except Exception:
+            pass
+    return last_seen_map
+
+def format_last_seen_human(ts_str):
+    if not ts_str:
+        return {"time_str": "-", "human": "Никогда"}
+    try:
+        # Time in UTC
+        dt = datetime.datetime.strptime(ts_str, "%Y-%m-%d %H:%M:%S").replace(tzinfo=datetime.timezone.utc)
+        now = datetime.datetime.now(datetime.timezone.utc)
+        diff_sec = max(0, int((now - dt).total_seconds()))
+        if diff_sec < 90:
+            human = "только что"
+        elif diff_sec < 3600:
+            human = f"{diff_sec // 60} мин. назад"
+        elif diff_sec < 86400:
+            human = f"{diff_sec // 3600} ч. назад"
+        elif diff_sec < 86400 * 30:
+            human = f"{diff_sec // 86400} дн. назад"
+        else:
+            human = f"{diff_sec // (86400 * 30)} мес. назад"
+        return {"time_str": ts_str, "human": human}
+    except Exception:
+        return {"time_str": ts_str, "human": ts_str}
+
 def get_rustdesk_details():
     pub_key_path = "/opt/rustdesk/id_ed25519.pub"
     pub_key = ""
@@ -140,6 +199,9 @@ def get_rustdesk_details():
     # Services status
     code_sig, out_sig, _ = run_cmd("systemctl is-active rustdesksignal.service")
     code_rel, out_rel, _ = run_cmd("systemctl is-active rustdeskrelay.service")
+
+    active_ips = get_active_rustdesk_ips()
+    last_seen_map = get_rustdesk_peer_last_seen()
 
     peers = []
     db_path = "/opt/rustdesk/db_v2.sqlite3"
@@ -171,10 +233,23 @@ def get_rustdesk_details():
                         pass
 
                 geo = resolve_geoip(ip_addr) if ip_addr != "-" else {"country": "", "flag": "💻"}
+                is_online = (ip_addr in active_ips) if ip_addr != "-" else False
+
+                raw_ts = last_seen_map.get(str(pid))
+                if is_online:
+                    last_seen_info = {"time_str": "Сейчас онлайн", "human": "онлайн"}
+                elif raw_ts:
+                    last_seen_info = format_last_seen_human(raw_ts)
+                else:
+                    last_seen_info = format_last_seen_human(created_at)
+
                 peers.append({
                     "id": pid or "-",
                     "uuid": uuid_str,
                     "ip": ip_addr,
+                    "is_online": is_online,
+                    "last_seen": last_seen_info["human"],
+                    "last_seen_time": last_seen_info["time_str"],
                     "created_at": created_at or "-",
                     "country": geo.get("country", ""),
                     "flag": geo.get("flag", "💻")
@@ -1103,6 +1178,8 @@ def render_html():
               <thead>
                 <tr style="border-bottom: 1px solid var(--card-border); color: var(--text-muted);">
                   <th style="padding: 8px;">Device ID</th>
+                  <th style="padding: 8px;">Статус сети</th>
+                  <th style="padding: 8px;">Последняя активность</th>
                   <th style="padding: 8px;">IP / Локация</th>
                   <th style="padding: 8px;">UUID</th>
                   <th style="padding: 8px; text-align: right;">Действие</th>
@@ -1829,14 +1906,23 @@ def render_html():
         const tbody = document.getElementById("rd-peers-tbody");
         tbody.innerHTML = "";
         if (!data.peers || data.peers.length === 0) {{
-          tbody.innerHTML = "<tr><td colspan='4' style='padding: 1.5rem; text-align: center; color: var(--text-muted);'>Нет подключенных устройств</td></tr>";
+          tbody.innerHTML = "<tr><td colspan='6' style='padding: 1.5rem; text-align: center; color: var(--text-muted);'>Нет подключенных устройств</td></tr>";
           return;
         }}
         data.peers.forEach(p => {{
           const tr = document.createElement("tr");
           tr.style.borderBottom = "1px solid var(--card-border)";
+          const onlineBadge = p.is_online
+            ? `<span class="badge badge-success"><span class="pulse-dot" style="width:6px;height:6px;"></span> Онлайн</span>`
+            : `<span class="badge badge-danger">Оффлайн</span>`;
+
           tr.innerHTML = `
             <td style="padding: 8px; font-weight: 700; color: var(--accent);">💻 ${{p.id}}</td>
+            <td style="padding: 8px;">${{onlineBadge}}</td>
+            <td style="padding: 8px; font-size: 0.8rem;">
+              <b>${{p.last_seen}}</b>
+              <div style="font-size: 0.7rem; color: var(--text-muted);">${{p.last_seen_time}}</div>
+            </td>
             <td style="padding: 8px;">${{p.flag}} <b>${{p.ip}}</b> <span style="font-size: 0.72rem; color: var(--text-muted);">(${{p.country}})</span></td>
             <td style="padding: 8px; font-family: monospace; font-size: 0.72rem; color: var(--text-muted);">${{p.uuid}}</td>
             <td style="padding: 8px; text-align: right;">
