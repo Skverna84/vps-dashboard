@@ -717,9 +717,11 @@ def render_html():
       --bar-bg: #e2e8f0;
       --modal-bg: rgba(241, 245, 249, 0.85);
     }}
-    * {{ box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }}
+    * {{ box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, "Noto Color Emoji", "Apple Color Emoji", "Segoe UI Emoji", sans-serif; }}
     body {{ background-color: var(--bg); color: var(--text); min-height: 100vh; padding: 1.5rem; transition: background-color 0.3s; }}
     .container {{ max-width: 1280px; margin: 0 auto; }}
+
+    .icon {{ display: inline-block; vertical-align: middle; line-height: 1; font-family: "Segoe UI Emoji", "Apple Color Emoji", "Noto Color Emoji", sans-serif; font-size: 1.1em; }}
 
     header {{ display: flex; justify-content: space-between; align-items: center; margin-bottom: 1.5rem; flex-wrap: wrap; gap: 1rem; }}
     .logo-area {{ display: flex; align-items: center; gap: 0.75rem; }}
@@ -728,16 +730,20 @@ def render_html():
     .title p {{ color: var(--text-muted); font-size: 0.85rem; }}
     .header-controls {{ display: flex; align-items: center; gap: 0.6rem; flex-wrap: wrap; }}
 
-    .btn {{ background: var(--card); border: 1px solid var(--card-border); color: var(--text); padding: 0.45rem 0.9rem; border-radius: 8px; cursor: pointer; font-size: 0.85rem; font-weight: 500; display: inline-flex; align-items: center; gap: 0.4rem; transition: all 0.2s; user-select: none; }}
+    .btn {{ background: var(--card); border: 1px solid var(--card-border); color: var(--text); padding: 0.45rem 0.9rem; border-radius: 8px; cursor: pointer; font-size: 0.85rem; font-weight: 500; display: inline-flex; align-items: center; justify-content: center; gap: 0.45rem; transition: all 0.2s; user-select: none; line-height: 1.2; text-decoration: none; }}
     .btn:hover {{ background: var(--card-border); }}
     .btn-primary {{ background: var(--accent); border-color: var(--accent); color: white; }}
     .btn-primary:hover {{ background: var(--accent-hover); }}
     .btn-outline {{ background: transparent; border-color: var(--card-border); }}
-    .btn-sm {{ padding: 0.25rem 0.55rem; font-size: 0.75rem; border-radius: 6px; }}
+    .btn-sm {{ padding: 0.35rem 0.65rem; font-size: 0.78rem; border-radius: 6px; }}
     .btn-danger {{ background: rgba(239, 68, 68, 0.15); border-color: var(--danger); color: var(--danger); }}
     .btn-danger:hover {{ background: var(--danger); color: white; }}
     .btn-success {{ background: rgba(16, 185, 129, 0.15); border-color: var(--success); color: var(--success); }}
     .btn-success:hover {{ background: var(--success); color: white; }}
+
+    .badge {{ font-size: 0.75rem; font-weight: 600; padding: 3px 8px; border-radius: 8px; display: inline-flex; align-items: center; gap: 4px; line-height: 1.2; }}
+    .project-actions {{ display: flex; align-items: center; gap: 0.5rem; flex-wrap: wrap; justify-content: flex-end; }}
+    .project-card {{ display: flex; justify-content: space-between; align-items: center; padding: 1rem; border-bottom: 1px solid var(--card-border); gap: 1rem; }}
 
     .select-input {{ background: var(--card); border: 1px solid var(--card-border); color: var(--text); padding: 0.45rem 0.6rem; border-radius: 8px; font-size: 0.85rem; outline: none; cursor: pointer; }}
     .text-input {{ background: var(--card); border: 1px solid var(--card-border); color: var(--text); padding: 0.4rem 0.6rem; border-radius: 6px; font-size: 0.8rem; outline: none; }}
@@ -1435,6 +1441,9 @@ def render_html():
           let extraBtns = "";
           if (p.id === "docker") {{
             extraBtns = `<button class="btn btn-sm btn-primary" onclick="openDockerModal()">🐳 Контейнеры</button> `;
+          }}
+          if (p.id === "rustdesk") {{
+            extraBtns = `<button class="btn btn-sm btn-primary" onclick="openRustDeskModal()">🖥️ RustDesk</button> `;
           }}
 
           div.innerHTML = `
